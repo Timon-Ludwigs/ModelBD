@@ -1,0 +1,2360 @@
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import sys
+import random
+from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+import numpy as np
+from tqdm.auto import tqdm
+from torch.utils.data import Dataset, DataLoader
+import json
+import matplotlib.pyplot as plt
+from datetime import datetime
+import os
+sys.path.append(".")
+from discrete_diffusion_language_models.src.tokenizer import CustomTokenizer
+#from discrete_diffusion_language_models.src2.plot_metrics import MetricsTracker
+
+@dataclass
+class ReactionMD4Config:
+    """Configuration for Reaction Product Generation MD4."""
+    vocab_size: int = 1447  
+    max_seq_length: int = 230 
+    d_model: int = 512
+    n_layers: int = 6
+    n_heads: int = 8
+    d_ff: int = 2048
+    dropout: float = 0.1
+    mask_token_id: int = 2
+    reactant_sep_token_id: int = 25
+    pad_token_id: int = 0
+    eos_token_id: int = 3
+    noagent_token_id: int = 5
+    max_product_tokens: int = 82
+    noise_schedule: str = "cosine"  # "linear", "cosine", "geometric"
+    timesteps: int = 1000
+    
+    # Set it here, because if not mask_token_id will be assigned to vocab_size (since [MASK] in the paper is at m+1)
+    def __post_init__(self):
+        if self.mask_token_id == -1:
+            self.mask_token_id = self.vocab_size
+
+
+def preprocess_reaction_for_training(reaction_tuple, 
+                                      tokenizer: CustomTokenizer, config,
+                                      conditioning_strategy="dual"):
+    """
+    Enhanced preprocessing with better class conditioning strategies.
+    Extracts reaction class from the input string and processes internally.
+    
+    FIXED: Product mask now excludes class tokens to ensure only products are generated.
+    
+    Args:
+        reaction_str_with_class: e.g., 'CCO>NaOH>CCCBr 2.6.23' or 'CCO>>CCCBr 2.6.23'
+        tokenizer: CustomTokenizer instance
+        config: Model configuration
+        conditioning_strategy: 'single', 'dual', 'prefix', or 'interleaved'
+    
+    Returns:
+        x_masked: Not used in D3PM training, but kept for compatibility
+        x_target: Original reaction sequence with class conditioning
+        product_mask: Boolean mask for product positions (EXCLUDING class tokens)
+    """
+    
+    # Extract reaction class from the end of the string
+    parts_with_class = reaction_tuple.strip().split()
+    if len(parts_with_class) < 2:
+        raise ValueError(f"Expected format 'reaction class', got: {reaction_tuple}")
+    
+    # Last part is the reaction class, everything else is the reaction string
+    reaction_class = parts_with_class[-1]
+    reaction_str = " ".join(parts_with_class[:-1])
+    
+    # Parse the reaction string
+    parts = reaction_str.split(">")
+    if len(parts) == 3 and parts[1] == "":
+        reactants, product = parts[0], parts[2]
+        agents = tokenizer.noagent_token
+    elif len(parts) == 3:
+        reactants, agents, product = parts
+    elif len(parts) == 2:
+        reactants, product = parts
+        agents = tokenizer.noagent_token
+    else:
+        raise ValueError(f"Unexpected reaction format: {reaction_str}")
+    
+    # Create class token
+    class_token = f"[CLS:{reaction_class.replace('.', '_')}]"
+    class_id = tokenizer.get_special_token_id(class_token)
+    
+    # Tokenize each part
+    react_ids = tokenizer.encode(reactants)
+    agents_ids = tokenizer.encode(agents)
+    prod_ids = tokenizer.encode(product)
+    sep_id = tokenizer.get_special_token_id(">")
+    
+    # Build the sequence based on conditioning strategy
+    if conditioning_strategy == "dual":
+        # Recommended: class at beginning and before products
+        x_target = (
+            [class_id] + 
+            react_ids + [sep_id] +
+            agents_ids + [sep_id] +
+            [class_id] +  # Class token before products
+            prod_ids + [tokenizer.eos_token_id]
+        )
+        # Product starts AFTER the second class token
+        product_start_idx = 1 + len(react_ids) + 1 + len(agents_ids) + 1 + 1  # +1 for the class token before products
+        
+    elif conditioning_strategy == "single":
+        # Class token only at the beginning
+        x_target = (
+            [class_id] + 
+            react_ids + [sep_id] +
+            agents_ids + [sep_id] +
+            prod_ids + [tokenizer.eos_token_id]
+        )
+        # Product starts right after the second separator
+        product_start_idx = 1 + len(react_ids) + 1 + len(agents_ids) + 1
+        
+    elif conditioning_strategy == "prefix":
+        # Class information as prefix tokens
+        class_sep_id = tokenizer.get_special_token_id("[SEP]")
+        x_target = (
+            [class_id] + [class_id] + [class_sep_id] +  # [CLASS] class [SEP]
+            react_ids + [sep_id] +
+            agents_ids + [sep_id] +
+            prod_ids + [tokenizer.eos_token_id]
+        )
+        # Product starts after all the prefix and separators
+        product_start_idx = 3 + len(react_ids) + 1 + len(agents_ids) + 1
+        
+    elif conditioning_strategy == "interleaved":
+        # Class tokens interleaved throughout
+        x_target = (
+            [class_id] + 
+            react_ids + [sep_id] +
+            [class_id] +  # Class token after reactants
+            agents_ids + [sep_id] +
+            [class_id] +  # Class token before products
+            prod_ids + [tokenizer.eos_token_id]
+        )
+        # Product starts AFTER the last class token
+        product_start_idx = 1 + len(react_ids) + 1 + 1 + len(agents_ids) + 1 + 1  # +1 for each class token
+        
+    else:
+        raise ValueError(f"Unknown conditioning strategy: {conditioning_strategy}")
+    
+    # For D3PM, we don't need x_masked as input
+    x_masked = x_target.copy()
+    
+    # Truncate if necessary
+    if len(x_target) > config.max_seq_length:
+        x_target = x_target[:config.max_seq_length]
+        x_masked = x_masked[:config.max_seq_length]
+    
+    # Pad to max_seq_length
+    pad_len = config.max_seq_length - len(x_target)
+    x_target += [config.pad_token_id] * pad_len
+    x_masked += [config.pad_token_id] * pad_len
+    
+    # Create product mask - FIXED to exclude class tokens and only mark actual product tokens
+    product_mask = [False] * config.max_seq_length
+    
+    # The product mask should ONLY cover the actual product tokens, not the class tokens
+    # Set mask for actual product tokens only (from product_start_idx for len(prod_ids) tokens)
+    product_end_idx = min(product_start_idx + len(prod_ids), config.max_seq_length)
+    
+    for i in range(product_start_idx, product_end_idx):
+        product_mask[i] = True
+    
+    return torch.tensor(x_masked), torch.tensor(x_target), torch.tensor(product_mask)
+
+def create_inference_input(reactants: str, agents: str, reaction_class: str, 
+                           tokenizer, config: ReactionMD4Config, 
+                           conditioning_strategy="dual"):
+    """
+    Create input for inference with proper class conditioning.
+    The class tokens are placed but NOT masked, only product positions are masked.
+    
+    Args:
+        reactants: Reactant SMILES string
+        agents: Agent SMILES string (can be empty)
+        reaction_class: Reaction class string (e.g., "2.6.23")
+        tokenizer: CustomTokenizer instance
+        config: Model configuration
+        conditioning_strategy: Same as in training ('single', 'dual', 'prefix', 'interleaved')
+    
+    Returns:
+        input_seq: Tensor with reactants>agents>[CLASS]?[MASK]...[MASK] (class placement depends on strategy)
+        product_start_idx: Index where actual product tokens should start being generated
+    """
+    # If there are no agents supplied, replace it with the [NOAGENT] token
+    if not agents:
+        agents = tokenizer.noagent_token
+    
+    # Create class token
+    class_token = f"[CLS:{reaction_class.replace('.', '_')}]"
+    class_id = tokenizer.get_special_token_id(class_token)
+    
+    # Tokenize the reactant and agent
+    react_ids = tokenizer.encode(reactants)
+    agents_ids = tokenizer.encode(agents)
+    sep_id = tokenizer.get_special_token_id(">")
+    
+    # Build prefix based on conditioning strategy
+    if conditioning_strategy == "dual":
+        # Class at beginning and before products
+        prefix = [class_id] + react_ids + [sep_id] + agents_ids + [sep_id] + [class_id]
+        # Products will start after the second class token
+        product_start_idx = len(prefix)
+        
+    elif conditioning_strategy == "single":
+        # Class only at beginning
+        prefix = [class_id] + react_ids + [sep_id] + agents_ids + [sep_id]
+        product_start_idx = len(prefix)
+        
+    elif conditioning_strategy == "prefix":
+        # Class as prefix with separator
+        class_sep_id = tokenizer.get_special_token_id("[SEP]")
+        prefix = [class_id] + [class_id] + [class_sep_id] + react_ids + [sep_id] + agents_ids + [sep_id]
+        product_start_idx = len(prefix)
+        
+    elif conditioning_strategy == "interleaved":
+        # Class tokens interleaved
+        prefix = ([class_id] + react_ids + [sep_id] + [class_id] + 
+                 agents_ids + [sep_id] + [class_id])
+        product_start_idx = len(prefix)
+        
+    else:
+        raise ValueError(f"Unknown conditioning strategy: {conditioning_strategy}")
+    
+    # Check if prefix is too long
+    min_required_space = 2  # At least 1 mask token + 1 EOS token
+    if len(prefix) >= config.max_seq_length - min_required_space:
+        max_prefix_len = config.max_seq_length - min_required_space
+        # Try to preserve the class tokens and separators if possible
+        print(f"Warning: Prefix truncated from {len(prefix)} to {max_prefix_len} tokens")
+        prefix = prefix[:max_prefix_len]
+        product_start_idx = len(prefix)
+    
+    # Fill rest with MASK tokens until max_len - 1 (reserve space for EOS)
+    n_mask_tokens = config.max_seq_length - len(prefix) - 1  # -1 for EOS
+    
+    # Ensure we have at least 1 mask token
+    if n_mask_tokens <= 0:
+        raise ValueError(f"Cannot fit sequence: prefix_len={len(prefix)}, max_seq_length={config.max_seq_length}")
+    
+    # Build final sequence
+    input_seq = prefix + [config.mask_token_id] * n_mask_tokens + [tokenizer.eos_token_id]
+    
+    # Pad if needed
+    if len(input_seq) < config.max_seq_length:
+        input_seq += [config.pad_token_id] * (config.max_seq_length - len(input_seq))
+    
+    return torch.tensor(input_seq), product_start_idx
+
+class ReactionClassEmbedder(nn.Module):
+    """
+    Simplified reaction class embedder that avoids dimension mismatch issues.
+    This version directly projects each class component to d_model and combines them.
+    """
+    
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Each embedding directly outputs d_model dimensions
+        self.main_class_embed = nn.Embedding(20, config.d_model)  # Main class (0-19)
+        self.sub_class_embed = nn.Embedding(100, config.d_model)  # Sub class (0-99)
+        self.subsub_class_embed = nn.Embedding(100, config.d_model)  # Sub-sub class (0-99)
+        
+        # Learnable weights for combining the three embeddings
+        self.combine_weights = nn.Parameter(torch.ones(3) / 3)
+        
+        # Optional: MLP to further process the combined embedding
+        self.projection = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout)
+        )
+        
+    def encode_single(self, reaction_class: str, device):
+        """Encode single reaction class string like '2.6.23'"""
+        # Handle default/unknown class
+        if not reaction_class or reaction_class == "0.0.0":
+            return torch.zeros(self.config.d_model, device=device)
+        
+        # Parse reaction class
+        parts = reaction_class.split('.')
+        
+        # Parse each part with defaults
+        main_id = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+        sub_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        subsub_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        
+        # Clip to valid range
+        main_id = min(main_id, 19)
+        sub_id = min(sub_id, 99)
+        subsub_id = min(subsub_id, 99)
+        
+        # Get embeddings (each is d_model dimensional)
+        main_emb = self.main_class_embed(torch.tensor(main_id, device=device))
+        sub_emb = self.sub_class_embed(torch.tensor(sub_id, device=device))
+        subsub_emb = self.subsub_class_embed(torch.tensor(subsub_id, device=device))
+        
+        # Weighted combination
+        weights = torch.softmax(self.combine_weights, dim=0)
+        combined = weights[0] * main_emb + weights[1] * sub_emb + weights[2] * subsub_emb
+        
+        # Project through MLP
+        output = self.projection(combined)
+        
+        return output
+    
+    def encode_batch(self, reaction_classes: List[str], device):
+        """Encode batch of reaction class strings"""
+        embeddings = []
+        for rc in reaction_classes:
+            embeddings.append(self.encode_single(rc, device))
+        
+        # Stack and add sequence dimension
+        class_emb = torch.stack(embeddings, dim=0)  # [batch, d_model]
+        return class_emb.unsqueeze(1)  # [batch, 1, d_model]
+
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding. Used to inject sequence order information into token embeddings for the transformer backbone"""
+    
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        
+        # Create a tensor pe of shape (max_len, d_model) to hold all positional encodings
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
+                           (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        return x + self.pe[:seq_len, :].unsqueeze(0)
+
+
+class TimeEmbedding(nn.Module):
+    """Time embedding for diffusion timestep."""
+    
+    # Defines a small MLP that will process the sinusoidal embedding
+    # lets the model learn a richer representation of timesteps
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model)
+        )
+        
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # Sinusoidal embedding
+        # Each timestep embedding will use half_dim sine and half_dim cosine components
+        half_dim = self.d_model // 2
+        # Compute frequency scaling factor
+        emb = math.log(10000) / (half_dim - 1)
+        # Frequencies decreasing exponentially
+        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb) # shape: (half_dim,)
+        # Multiply each timestep t[i] with the frequencies
+        # each timestep is expanded into sinusoidal arguments
+        emb = t[:, None] * emb[None, :] # shape: (batch, half_dim)
+        # Concatenate sine and cosine parts
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1) # shape: (batch, half_dim)
+        
+        return self.mlp(emb)
+
+class CrossAttentionConditioning(nn.Module):
+    """Use cross-attention for reaction class conditioning"""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            config.d_model, config.n_heads, dropout=config.dropout,
+            batch_first=True
+        )
+        self.class_embedder = nn.Embedding(1000, config.d_model)  # For reaction classes
+        
+    def forward(self, x, reaction_class_ids):
+        # Embed reaction classes
+        class_embeds = self.class_embedder(reaction_class_ids)  # [batch, d_model]
+        class_embeds = class_embeds.unsqueeze(1)  # [batch, 1, d_model]
+        
+        # Cross-attention: x attends to class embeddings
+        x_attended, _ = self.cross_attn(
+            query=x,
+            key=class_embeds,
+            value=class_embeds
+        )
+        
+        return x + x_attended  # Residual connection
+
+""" class TransformerBlock(nn.Module):
+    # Transformer (encoder-only) block with time conditioning.
+    
+    def __init__(self, config: ReactionMD4Config):
+        super().__init__()
+        self.config = config
+        
+        self.ln1 = nn.LayerNorm(config.d_model)
+        self.attn = nn.MultiheadAttention(
+            config.d_model, config.n_heads, dropout=config.dropout,
+            batch_first=True
+        )
+        self.ln2 = nn.LayerNorm(config.d_model)
+        
+        # Time-conditioned MLP
+        self.time_mlp = nn.Linear(config.d_model, config.d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(config.d_model, config.d_ff),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_ff, config.d_model),
+            nn.Dropout(config.dropout)
+        )
+        
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, 
+                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Self-attention + Layer Norm
+        x_norm = self.ln1(x) # (batch, seq_len, d_model)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask) # MHA output (batch, seq_len, d_model)
+        x = x + attn_out # Residual add (batch, seq_len, d_model)
+        
+        # Time-conditioned MLP + Layer Norm
+        x_norm = self.ln2(x) # (batch, seq_len, d_model)
+        time_cond = self.time_mlp(time_emb).unsqueeze(1)  # (batch, 1, d_model)
+        x_norm = x_norm + time_cond  # Broadcast time conditioning (batch, seq_len, d_model)
+
+        # Feedforward MLP + Residual
+        mlp_out = self.mlp(x_norm) # (batch, seq_len, d_model)
+        x = x + mlp_out # (batch, seq_len, d_model)
+        
+        return x """
+
+class TransformerBlockWithCrossAttention(nn.Module):
+    """Enhanced Transformer block with cross-attention to reaction class"""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Self-attention components (unchanged from original)
+        self.ln1 = nn.LayerNorm(config.d_model)
+        self.self_attn = nn.MultiheadAttention(
+            config.d_model, config.n_heads, dropout=config.dropout,
+            batch_first=True
+        )
+        
+        # Cross-attention components (NEW)
+        self.ln_cross = nn.LayerNorm(config.d_model)
+        self.cross_attn = nn.MultiheadAttention(
+            config.d_model, config.n_heads, dropout=config.dropout,
+            batch_first=True
+        )
+        self.cross_dropout = nn.Dropout(config.dropout)
+        
+        # Feed-forward components (unchanged from original)
+        self.ln2 = nn.LayerNorm(config.d_model)
+        self.time_mlp = nn.Linear(config.d_model, config.d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(config.d_model, config.d_ff),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_ff, config.d_model),
+            nn.Dropout(config.dropout)
+        )
+        
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor,
+                class_emb: Optional[torch.Tensor] = None,
+                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: [batch, seq_len, d_model]
+            time_emb: [batch, d_model]
+            class_emb: [batch, 1, d_model] - reaction class embedding
+            attn_mask: Optional attention mask for self-attention
+        """
+        # Self-attention (same as original)
+        x_norm = self.ln1(x)
+        attn_out, _ = self.self_attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
+        x = x + attn_out  # Residual connection
+        
+        # Cross-attention to class embedding (NEW)
+        if class_emb is not None:
+            x_norm = self.ln_cross(x)
+            # Each position in sequence attends to the class embedding
+            cross_out, _ = self.cross_attn(
+                query=x_norm,
+                key=class_emb,
+                value=class_emb
+            )
+            cross_out = self.cross_dropout(cross_out)
+            x = x + cross_out  # Residual connection
+        
+        # Time-conditioned MLP (same as original)
+        x_norm = self.ln2(x)
+        time_cond = self.time_mlp(time_emb).unsqueeze(1)  # [batch, 1, d_model]
+        x_norm = x_norm + time_cond  # Broadcast time conditioning
+        
+        # Feed-forward
+        mlp_out = self.mlp(x_norm)
+        x = x + mlp_out  # Residual connection
+        
+        return x
+
+
+class ReactionMD4(nn.Module):
+    """
+    Modified ReactionMD4 with cross-attention conditioning.
+    Changes are marked with # MODIFIED or # NEW
+    """
+    
+    def __init__(self, config: ReactionMD4Config):
+        super().__init__()
+        self.config = config
+        
+        # Token embeddings (unchanged)
+        self.token_embedding = nn.Embedding(config.vocab_size + 1, config.d_model)
+        
+        # Position encoding (unchanged)
+        self.pos_encoding = PositionalEncoding(config.d_model, config.max_seq_length * 2)
+        
+        # Time embedding (unchanged)
+        self.time_embedding = TimeEmbedding(config.d_model)
+        
+        # NEW: Reaction class embedder
+        self.class_embedder = ReactionClassEmbedder(config)
+        
+        # MODIFIED: Use TransformerBlockWithCrossAttention instead of TransformerBlock
+        self.layers = nn.ModuleList([
+            TransformerBlockWithCrossAttention(config) for _ in range(config.n_layers)
+        ])
+        
+        self.ln_f = nn.LayerNorm(config.d_model)
+        self.output_head = nn.Linear(config.d_model, config.vocab_size)
+        self.dropout = nn.Dropout(config.dropout)
+        
+        # Initialize weights (unchanged)
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        """Initialize weights (unchanged from original)"""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+    
+    def get_masking_schedule(self, t: torch.Tensor) -> torch.Tensor:
+        """Get masking schedule (unchanged from original)"""
+        if self.config.noise_schedule == "linear":
+            return 1 - t
+        elif self.config.noise_schedule == "cosine":
+            return torch.cos(torch.pi / 2 * t)
+        elif self.config.noise_schedule == "geometric":
+            beta_min, beta_max = 1e-5, 20
+            return torch.exp(-beta_min * (1-t) * beta_max**t)
+        else:
+            raise ValueError(f"Unknown schedule: {self.config.noise_schedule}")
+    
+    def forward_sample(self, x_target: torch.Tensor, t: torch.Tensor, 
+                      product_mask: torch.Tensor) -> torch.Tensor:
+        """Forward diffusion process (unchanged from original)"""
+        alpha_t = self.get_masking_schedule(t)
+        alpha_t = alpha_t.unsqueeze(-1)
+        
+        keep_prob = torch.rand_like(x_target, dtype=torch.float)
+        should_keep = keep_prob < alpha_t
+        
+        should_mask = product_mask & ~should_keep
+        x_noisy = torch.where(should_mask, self.config.mask_token_id, x_target)
+        return x_noisy
+    
+    # NEW: Method to extract reaction classes from token sequences
+    def extract_reaction_classes(self, input_ids: torch.Tensor, tokenizer) -> List[str]:
+        """
+        Extract reaction class from tokenized sequences.
+        Based on your tokenizer, class tokens look like [CLS:2_6_23]
+        
+        Args:
+            input_ids: [batch, seq_len] tensor of token IDs
+            tokenizer: Your CustomTokenizer instance
+        
+        Returns:
+            List of reaction class strings like ["2.6.23", "1.1.1"]
+        """
+        batch_size = input_ids.shape[0]
+        classes = []
+        
+        for i in range(batch_size):
+            seq = input_ids[i].cpu().tolist()
+            class_found = False
+            
+            # Look for class tokens in the sequence
+            for token_id in seq:
+                # Skip special tokens
+                if token_id in [tokenizer.pad_token_id, tokenizer.mask_token_id, 
+                               tokenizer.eos_token_id, tokenizer.unk_token_id]:
+                    continue
+                
+                # Get the token string
+                token = tokenizer.id_to_token.get(token_id, "")
+                
+                # Check if it's a class token: [CLS:X_Y_Z]
+                if token.startswith("[CLS:") and token.endswith("]"):
+                    # Extract class: [CLS:2_6_23] -> 2.6.23
+                    class_str = token[5:-1]  # Remove "[CLS:" and "]"
+                    class_str = class_str.replace('_', '.')  # Convert underscores back to dots
+                    classes.append(class_str)
+                    class_found = True
+                    break
+            
+            if not class_found:
+                # Default class if none found
+                print(f"Warning: No reaction class found in sequence {i}")
+        
+        return classes
+    
+    # MODIFIED: Forward method now handles cross-attention
+    def forward(self, input_ids: torch.Tensor, t: torch.Tensor,
+                target_ids: Optional[torch.Tensor] = None,
+                product_mask: Optional[torch.Tensor] = None,
+                tokenizer = None) -> Dict[str, torch.Tensor]:  # NEW: Added tokenizer parameter
+        """
+        Forward pass with cross-attention conditioning.
+        
+        MODIFIED: Now extracts and uses reaction classes for cross-attention
+        """
+        batch_size, seq_len = input_ids.shape
+        
+        # Token embeddings (unchanged)
+        token_emb = self.token_embedding(input_ids)
+        
+        # Add positional encoding (unchanged)
+        x = self.pos_encoding(token_emb)
+        x = self.dropout(x)
+        
+        # Time embedding (unchanged)
+        time_emb = self.time_embedding(t)
+        
+        # NEW: Extract and embed reaction classes
+        if tokenizer is not None:
+            reaction_classes = self.extract_reaction_classes(input_ids, tokenizer)
+        else:
+            # Fallback if tokenizer not provided
+            reaction_classes = ["0.0.0"] * batch_size
+        
+        class_emb = self.class_embedder.encode_batch(reaction_classes, input_ids.device)
+        
+        # MODIFIED: Apply transformer layers with cross-attention
+        for layer in self.layers:
+            x = layer(x, time_emb, class_emb=class_emb)  # Added class_emb parameter
+        
+        x = self.ln_f(x)
+        
+        # Output logits (unchanged)
+        logits = self.output_head(x)
+        
+        outputs = {"logits": logits}
+        
+        # Compute loss during training (unchanged)
+        if target_ids is not None and product_mask is not None:
+            if product_mask.any():
+                is_masked = (input_ids == self.config.mask_token_id)
+                valid_positions = product_mask & (target_ids != self.config.pad_token_id) & is_masked
+                
+                if valid_positions.any():
+                    valid_targets = target_ids[valid_positions]
+                    valid_logits = logits[valid_positions]
+                    
+                    loss = F.cross_entropy(valid_logits, valid_targets, reduction='mean')
+                    outputs["loss"] = loss
+                else:
+                    outputs["loss"] = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+            else:
+                outputs["loss"] = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+        
+        return outputs
+    
+    def sample_step(self, xt: torch.Tensor, t_curr: torch.Tensor, 
+                    t_next: torch.Tensor, product_mask: torch.Tensor, 
+                    tokenizer, temperature: float = 1.0) -> torch.Tensor:
+        """
+        Modified sample_step that passes tokenizer.
+        Replace the existing sample_step method with this.
+        """
+        # MODIFIED: Pass tokenizer to forward
+        outputs = self(xt, t_curr, tokenizer=tokenizer)
+        logits = outputs["logits"] / temperature
+        
+        # Rest of the method remains the same
+        alpha_t = self.get_masking_schedule(t_curr).unsqueeze(-1)
+        alpha_s = self.get_masking_schedule(t_next).unsqueeze(-1)
+        
+        p_unmask = (alpha_s - alpha_t) / (1 - alpha_t + 1e-8)
+        p_unmask = torch.clamp(p_unmask, 0.0, 1.0)
+        
+        is_mask = (xt == self.config.mask_token_id)
+        can_unmask = is_mask & product_mask
+        
+        if can_unmask.any():
+            unmask_probs = torch.rand_like(xt, dtype=torch.float)
+            positions_to_unmask = can_unmask & (unmask_probs < p_unmask)
+            
+            if positions_to_unmask.any():
+                probs = F.softmax(logits[positions_to_unmask], dim=-1)
+                sampled_tokens = torch.argmax(probs, dim=-1)  # or use multinomial for sampling
+                xt = xt.clone()
+                xt[positions_to_unmask] = sampled_tokens
+        
+        return xt
+    
+    @torch.no_grad()
+    def sample(self, reactants_list: List[str], agents_list: List[str], 
+                reaction_classes_list: List[str], tokenizer,
+                num_steps: int = 100, temperature: float = 1.0,
+                conditioning_strategy: str = "dual",
+                return_initial_state: bool = True) -> Dict[str, List]:
+        """
+        Generate products with visualization of initial masked state.
+        
+        Args:
+            reactants_list: List of reactant SMILES strings
+            agents_list: List of agent SMILES strings (can be empty strings)
+            reaction_classes_list: List of reaction class strings
+            tokenizer: CustomTokenizer instance
+            num_steps: Number of diffusion steps
+            temperature: Sampling temperature
+            conditioning_strategy: How to place class tokens
+            return_initial_state: If True, also return the initial masked sequences
+        
+        Returns:
+            Dictionary containing:
+            - 'generated_products': List of generated product tensors
+            - 'initial_sequences': List of initial masked sequences (as strings)
+            - 'final_sequences': List of final complete sequences (as strings)
+            - 'product_start_indices': List of where products start in sequences
+        """
+        # If no input is provided, return empty results
+        batch_size = len(reactants_list)
+        if batch_size == 0:
+            return {
+                'generated_products': [],
+                'initial_sequences': [],
+                'final_sequences': [],
+                'product_start_indices': []
+            }
+            
+        device = next(self.parameters()).device
+        
+        # Create initial sequences with masked product regions
+        initial_seqs = []
+        product_masks = []
+        product_starts = []
+        
+        for reactants, agents, reaction_class in zip(reactants_list, agents_list, reaction_classes_list):
+            input_seq, product_start = create_inference_input(
+                reactants, agents, reaction_class, tokenizer, self.config, conditioning_strategy
+            )
+            initial_seqs.append(input_seq)
+            product_starts.append(product_start)
+            
+            # Create product mask
+            product_mask = torch.zeros(self.config.max_seq_length, dtype=torch.bool)
+            eos_pos = (input_seq == tokenizer.eos_token_id).nonzero()
+            if len(eos_pos) > 0:
+                eos_idx = eos_pos[0].item()
+                product_mask[product_start:eos_idx] = True
+            else:
+                product_mask[product_start:-1] = True
+            product_masks.append(product_mask)
+        
+        # Stack tensors
+        xt = torch.stack(initial_seqs).to(device)
+        product_mask = torch.stack(product_masks).to(device)
+        
+        # Store initial state for visualization
+        initial_sequences_str = []
+        if return_initial_state:
+            for i in range(batch_size):
+                initial_seq_tokens = xt[i].cpu().tolist()
+                # Decode the full sequence including [MASK] tokens
+                initial_seq_str = tokenizer.decode(initial_seq_tokens)
+                initial_sequences_str.append(initial_seq_str)
+        
+        # Create sampling schedule
+        timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+        
+        # Reverse diffusion process
+        for i in range(num_steps):
+            t_curr = timesteps[i].expand(batch_size)
+            t_next = timesteps[i + 1] if i < num_steps - 1 else torch.zeros_like(t_curr)
+            
+            xt = self.sample_step(xt, t_curr, t_next, product_mask, tokenizer, temperature)
+        
+        # Store final state for visualization
+        final_sequences_str = []
+        for i in range(batch_size):
+            final_seq_tokens = xt[i].cpu().tolist()
+            final_seq_str = tokenizer.decode(final_seq_tokens)
+            final_sequences_str.append(final_seq_str)
+        
+        # Extract generated products (only the actual product tokens)
+        generated_products = []
+        for i in range(batch_size):
+            product_start = product_starts[i]
+            product_tokens = xt[i, product_start:]
+            
+            valid_tokens = []
+            for token in product_tokens:
+                token_id = token.item()
+                if token_id in [self.config.pad_token_id, self.config.mask_token_id]:
+                    continue
+                elif token_id == self.config.eos_token_id:
+                    break
+                elif tokenizer.id_to_token.get(token_id, "").startswith("[CLS:"):
+                    continue
+                else:
+                    valid_tokens.append(token_id)
+            
+            generated_products.append(torch.tensor(valid_tokens, device=device))
+        
+        return {
+            'generated_products': generated_products,
+            'initial_sequences': initial_sequences_str,
+            'final_sequences': final_sequences_str,
+            'product_start_indices': product_starts
+        }
+    
+def generate_product_with_visualization(self, reactants: str, agents: str, reaction_class: str, 
+                                       tokenizer, num_steps: int = 100, temperature: float = 1.0,
+                                       conditioning_strategy: str = "dual",
+                                       verbose: bool = True) -> Dict[str, str]:
+    """
+    Generate a single reaction product with visualization of the generation process.
+    
+    Args:
+        reactants: Reactant SMILES string
+        agents: Agent SMILES string (can be empty)
+        reaction_class: Reaction class string
+        tokenizer: CustomTokenizer instance
+        num_steps: Number of diffusion steps
+        temperature: Sampling temperature
+        conditioning_strategy: How to place class tokens
+        verbose: If True, print the generation process
+        
+    Returns:
+        Dictionary containing:
+        - 'product': Generated product SMILES
+        - 'initial_sequence': Initial masked sequence
+        - 'final_sequence': Final complete sequence
+        - 'generation_info': Additional information about the generation
+    """
+    results = self.sample_with_visualization(
+        [reactants], [agents], [reaction_class], tokenizer, 
+        num_steps, temperature, conditioning_strategy, return_initial_state=True
+    )
+    
+    generated_product = ""
+    if results['generated_products'] and len(results['generated_products'][0]) > 0:
+        product_tokens = results['generated_products'][0].cpu().tolist()
+        generated_product = tokenizer.decode(product_tokens)
+    
+    generation_info = {
+        'product': generated_product,
+        'initial_sequence': results['initial_sequences'][0] if results['initial_sequences'] else "",
+        'final_sequence': results['final_sequences'][0] if results['final_sequences'] else "",
+        'product_start_idx': results['product_start_indices'][0] if results['product_start_indices'] else 0
+    }
+    
+    if verbose:
+        print("\n" + "="*60)
+        print("GENERATION PROCESS VISUALIZATION")
+        print("="*60)
+        print(f"Reactants: {reactants}")
+        print(f"Agents: {agents if agents else '[NOAGENT]'}")
+        print(f"Reaction Class: {reaction_class}")
+        print(f"Product starts at position: {generation_info['product_start_idx']}")
+        print("-"*60)
+        print(f"Initial (masked): {generation_info['initial_sequence']}")
+        print(f"Final (complete): {generation_info['final_sequence']}")
+        print(f"Generated product: {generation_info['product']}")
+        print("="*60)
+    
+    return generation_info
+
+class ReactionDataset(Dataset):
+    """Dataset for reaction SMILES strings."""
+    
+    def __init__(self, data: List[str], tokenizer, config: ReactionMD4Config):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.config = config
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        # Grab one reaction string from the dataset
+        reaction_str = self.data[idx].strip()
+        
+        # Preprocess reaction string into training inputs
+        # - x_masked: input tokens where some positions are masked (diffusion step)
+        # - x_target: ground-truth tokens
+        # - product_mask: boolean mask indicating product token positions
+        x_masked, x_target, product_mask = preprocess_reaction_for_training(
+            reaction_str, self.tokenizer, self.config
+        )
+        
+        return {
+            "x_masked": x_masked,
+            "x_target": x_target,
+            "product_mask": product_mask
+        }
+    
+def train_step_with_cross_attention(model, batch, tokenizer, device):
+    """
+    Modified training step that passes tokenizer to the model.
+    
+    Replace your existing training step with this.
+    """
+    x_masked = batch['x_masked'].to(device)
+    x_target = batch['x_target'].to(device)
+    product_mask = batch['product_mask'].to(device)
+    
+    batch_size_curr = x_masked.shape[0]
+    
+    # Sample random time steps
+    t = torch.rand(batch_size_curr, device=device)
+    
+    # Forward diffusion
+    x_noisy = model.forward_sample(x_target, t, product_mask)
+    
+    # MODIFIED: Pass tokenizer to forward method
+    outputs = model(x_noisy, t, x_target, product_mask, tokenizer=tokenizer)
+    
+    return outputs
+
+def calculate_accuracy_fixed(predictions: torch.Tensor, targets: torch.Tensor, 
+                            mask: torch.Tensor, pad_token_id: int, 
+                            noisy_input: torch.Tensor, mask_token_id: int) -> Dict[str, float]:
+    """Calculate token-wise and sequence-wise accuracy - FIXED VERSION."""
+    
+    # Only consider positions that are:
+    # 1. In the product mask (product region)
+    # 2. Not padding tokens  
+    # 3. Actually masked in the noisy input (what the model needs to predict)
+    actually_masked = (noisy_input == mask_token_id)
+    valid_positions = mask & (targets != pad_token_id) & actually_masked
+    
+    if not valid_positions.any():
+        return {"token_accuracy": 0.0, "sequence_accuracy": 0.0}
+    
+    # Token-wise accuracy - only on positions the model actually predicted
+    correct_tokens = (predictions == targets) & valid_positions # True exactly where prediction equals target and the position is valid
+    token_accuracy = correct_tokens.sum().float() / valid_positions.sum().float() # number of correct valid tokens divided by number of valid tokens
+    
+    # Sequence-wise accuracy - all masked tokens in each sequence must be correct
+    batch_size = predictions.shape[0]
+    sequence_correct = torch.zeros(batch_size, dtype=torch.bool, device=predictions.device)
+    
+    for i in range(batch_size):
+        seq_mask = valid_positions[i]
+        if seq_mask.any():
+            seq_correct = (predictions[i] == targets[i]) & seq_mask
+            sequence_correct[i] = seq_correct.sum() == seq_mask.sum()
+        else:
+            # If no tokens to predict, consider it "correct"
+            sequence_correct[i] = True
+    
+    sequence_accuracy = sequence_correct.float().mean()
+    
+    return {
+        "token_accuracy": token_accuracy.item(),
+        "sequence_accuracy": sequence_accuracy.item(),
+        "num_predicted_tokens": valid_positions.sum().item()
+    }
+
+
+def calculate_generation_accuracy(model: ReactionMD4, val_dataset, tokenizer, 
+                                num_samples: int = 50) -> Dict[str, float]:
+    """Calculate accuracy on actual generation task."""
+    model.eval()
+    device = next(model.parameters()).device
+    
+    correct_products = 0
+    total_samples = 0
+    
+    # Sample random indices
+    sample_indices = random.sample(range(len(val_dataset)), min(num_samples, len(val_dataset)))
+    
+    with torch.no_grad():
+        for idx in sample_indices:
+            try:
+                sample = val_dataset[idx]
+                x_target = sample['x_target']
+                
+                # Decode target to get components
+                original_reaction = tokenizer.decode(x_target.tolist())
+                parts = original_reaction.split('>')
+
+                if len(parts) == 3 and parts[1] == "":
+                    reactants, true_product = parts[0], parts[2]
+                    agents = tokenizer.noagent_token
+                elif len(parts) == 3:
+                    reactants, agents, true_product = parts
+                elif len(parts) == 2:
+                    reactants, true_product = parts
+                    agents = tokenizer.noagent_token
+                else:
+                    continue
+                
+                """ if len(parts) >= 3:
+                    reactants, agents, true_product = parts[0], parts[1], parts[2]
+                elif len(parts) == 2:
+                    reactants, agents, true_product = parts[0], "", parts[1]
+                else:
+                    continue """
+                
+                # Generate product
+                generated_product = model.generate_product_with_visualization(
+                    reactants, agents, tokenizer, num_steps=50, temperature=1.0
+                )
+                
+                # Compare (exact match)
+                if generated_product.strip() == true_product.strip():
+                    correct_products += 1
+                
+                total_samples += 1
+                
+            except Exception as e:
+                continue
+    
+    generation_accuracy = correct_products / max(total_samples, 1)
+    return {
+        "generation_accuracy": generation_accuracy,
+        "correct_samples": correct_products,
+        "total_samples": total_samples
+    }
+
+def calculate_accuracy(predictions: torch.Tensor, targets: torch.Tensor, 
+                      mask: torch.Tensor, pad_token_id: int) -> Dict[str, float]:
+    """Calculate token-wise and sequence-wise accuracy.
+        predictions: token ids predicted by the model, shape [batch, seq_len]
+        targets: ground-truth token ids
+        mask: boolean mask [batch, seq_len] indicating which positions to evaluate
+        pad_token_id: int id used for padding
+    """
+    # Only consider positions in the mask and not padding
+    valid_positions = mask & (targets != pad_token_id) # Boolean tensor [batch, seq_len]
+    
+    # If no position in the whole batch is valid
+    if not valid_positions.any():
+        return {"token_accuracy": 0.0, "sequence_accuracy": 0.0}
+    
+    # Token-wise accuracy
+    # True where the prediction matches the target and the position is valid
+    correct_tokens = (predictions == targets) & valid_positions # Boolean [batch, seq_len]
+    # correct_tokens.sum() counts Trues and divides by the total number of valid positions
+    token_accuracy = correct_tokens.sum().float() / valid_positions.sum().float()
+    
+    # Sequence-wise accuracy (all tokens in sequence must be correct)
+    batch_size = predictions.shape[0] # Number of sequences in the batch
+    # Boolean vector [batch], initialized to all False
+    sequence_correct = torch.zeros(batch_size, dtype=torch.bool, device=predictions.device) 
+    
+    for i in range(batch_size):
+        # seq_mask: boolean [seq_len] selecting valid positions for sample i
+        seq_mask = valid_positions[i]
+        if seq_mask.any():
+            # Boolean [seq_len]: True where prediction equals target and position is valid
+            seq_correct = (predictions[i] == targets[i]) & seq_mask
+            # If the number of correct valid tokens equals the number of valid tokens, then 
+            # all valid tokens are correct -> mark the whole sequence as correct.Otherwise, it 
+            # remains False
+            sequence_correct[i] = seq_correct.sum() == seq_mask.sum()
+    # proportion of sequences that are entirely correct on valid positions
+    sequence_accuracy = sequence_correct.float().mean()
+    
+    return {
+        "token_accuracy": token_accuracy.item(),
+        "sequence_accuracy": sequence_accuracy.item()
+    }
+
+def train_reaction_md4_with_tracking(model: ReactionMD4, train_dataset, val_dataset, tokenizer,
+                                   num_epochs: int = 10, batch_size: int = 32,
+                                   learning_rate: float = 1e-4, validation_freq: int = 1,
+                                   plot_freq: int = 5, save_plots: bool = True, plots_dir: str = "training_plots"):
+    """Enhanced training loop with metrics tracking and plotting."""
+    
+    device = next(model.parameters()).device
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs * len(train_dataloader))
+    
+    # Initialize metrics tracker
+    metrics_tracker = MetricsTracker()
+    best_val_loss = float('inf')
+    
+    print(f"Starting training for {num_epochs} epochs...")
+    print(f"Train batches: {len(train_dataloader)}, Val batches: {len(val_dataloader)}")
+    print("=" * 80)
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0
+        train_token_acc = 0
+        train_seq_acc = 0
+        num_successful_batches = 0
+        
+        pbar_train = tqdm(
+            train_dataloader, 
+            desc=f"Epoch {epoch+1}/{num_epochs} [Training]",
+            ncols=120,
+            leave=True,
+            position=0
+        )
+        
+        for batch_idx, batch in enumerate(pbar_train):
+            # Load masked inputs, targets, and product masks for the batch
+            x_masked = batch['x_masked'].to(device)
+            x_target = batch['x_target'].to(device) 
+            product_mask = batch['product_mask'].to(device)
+            
+            # Get current batch size 
+            batch_size_curr = x_masked.shape[0]
+            
+            # Sample random time steps for forward diffusion (noisy masking)
+            t = torch.rand(batch_size_curr, device=device)
+            
+            # Forward diffusion (add noise to target based on schedule)
+            x_noisy = model.forward_sample(x_target, t, product_mask)
+            
+            # Forward pass
+            outputs = model(x_noisy, t, x_target, product_mask, tokenizer=tokenizer)
+            loss = outputs.get('loss', torch.tensor(0.0, device=device, requires_grad=True))
+            
+            # Skip if no valid loss or gradients are not required
+            if loss.item() <= 0 or not loss.requires_grad:
+                continue
+            
+            # Calculate accuracy
+            """ if product_mask.any():
+                with torch.no_grad():
+                    logits = outputs["logits"]
+                    predictions = torch.argmax(logits, dim=-1)
+                    acc_metrics = calculate_accuracy(predictions, x_target, product_mask, model.config.pad_token_id)
+                    train_token_acc += acc_metrics["token_accuracy"]
+                    train_seq_acc += acc_metrics["sequence_accuracy"] """
+            
+            if product_mask.any():
+                with torch.no_grad():
+                    logits = outputs["logits"]
+                    predictions = torch.argmax(logits, dim=-1)
+                    
+                    # Use the fixed accuracy calculation that considers what was actually masked
+                    acc_metrics = calculate_accuracy_fixed(
+                        predictions, x_target, product_mask, 
+                        model.config.pad_token_id, x_noisy, model.config.mask_token_id
+                    )
+                    train_token_acc += acc_metrics["token_accuracy"]
+                    train_seq_acc += acc_metrics["sequence_accuracy"]
+
+            if product_mask.any():
+                with torch.no_grad():
+                    logits = outputs["logits"]
+                    predictions = torch.argmax(logits, dim=-1)
+                    
+                    # Use the fixed accuracy calculation
+                    acc_metrics = calculate_accuracy_fixed(
+                        predictions, x_target, product_mask, 
+                        model.config.pad_token_id, x_noisy, model.config.mask_token_id
+                    )
+                    train_token_acc += acc_metrics["token_accuracy"]
+                    train_seq_acc += acc_metrics["sequence_accuracy"]
+                    
+                    # Optional: Add debug info periodically
+                    if batch_idx % 200 == 0:
+                        print(f"Batch {batch_idx}: Predicting {acc_metrics.get('num_predicted_tokens', 0)} tokens")
+                        
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            train_loss += loss.item()
+            num_successful_batches += 1
+            
+            # Update progress bar
+            if num_successful_batches > 0:
+                avg_train_loss = train_loss / num_successful_batches
+                avg_token_acc = train_token_acc / num_successful_batches
+                avg_seq_acc = train_seq_acc / num_successful_batches
+                
+                pbar_train.set_postfix({
+                    "loss": f"{avg_train_loss:.4f}",
+                    "tok_acc": f"{avg_token_acc:.3f}",
+                    "seq_acc": f"{avg_seq_acc:.3f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.2e}"
+                })
+        
+        pbar_train.close()
+        
+        # Calculate final training metrics
+        if num_successful_batches > 0:
+            avg_train_loss = train_loss / num_successful_batches
+            avg_train_token_acc = train_token_acc / num_successful_batches
+            avg_train_seq_acc = train_seq_acc / num_successful_batches
+        else:
+            avg_train_loss = avg_train_token_acc = avg_train_seq_acc = 0.0
+        
+        current_lr = scheduler.get_last_lr()[0]
+        
+        # Validation phase
+        avg_val_loss = avg_val_token_acc = avg_val_seq_acc = None
+        
+        if (epoch + 1) % validation_freq == 0:
+            model.eval()
+            val_loss = 0
+            val_token_acc = 0
+            val_seq_acc = 0
+            num_val_batches = 0
+            
+            pbar_val = tqdm(
+                val_dataloader, 
+                desc=f"Epoch {epoch+1}/{num_epochs} [Validation]",
+                ncols=120,
+                leave=True,
+                position=0
+            )
+            
+            with torch.no_grad():
+                for batch in pbar_val:
+                    x_masked = batch['x_masked'].to(device)
+                    x_target = batch['x_target'].to(device)
+                    product_mask = batch['product_mask'].to(device)
+                    
+                    batch_size_curr = x_masked.shape[0]
+                    
+                    # Sample random time steps for validation
+                    t = torch.rand(batch_size_curr, device=device)
+                    
+                    # Forward diffusion
+                    x_noisy = model.forward_sample(x_target, t, product_mask)
+                    
+                    # Forward pass
+                    outputs = model(x_noisy, t, x_target, product_mask, tokenizer=tokenizer)
+                    loss = outputs.get('loss', torch.tensor(0.0, device=device))
+                    
+                    # Calculate accuracy
+                    """ if product_mask.any():
+                        logits = outputs["logits"]
+                        predictions = torch.argmax(logits, dim=-1)
+                        acc_metrics = calculate_accuracy(predictions, x_target, product_mask, model.config.pad_token_id)
+                        val_token_acc += acc_metrics["token_accuracy"]
+                        val_seq_acc += acc_metrics["sequence_accuracy"] """
+                    if product_mask.any():
+                        with torch.no_grad():
+                            logits = outputs["logits"]
+                            predictions = torch.argmax(logits, dim=-1)
+                            
+                            # Use the fixed accuracy calculation
+                            acc_metrics = calculate_accuracy_fixed(
+                                predictions, x_target, product_mask, 
+                                model.config.pad_token_id, x_noisy, model.config.mask_token_id
+                            )
+                            val_token_acc += acc_metrics["token_accuracy"]
+                            val_seq_acc += acc_metrics["sequence_accuracy"]
+                                        
+                    val_loss += loss.item()
+                    num_val_batches += 1
+                    
+                    # Update validation progress bar
+                    if num_val_batches > 0:
+                        avg_val_loss_temp = val_loss / num_val_batches
+                        avg_val_token_acc_temp = val_token_acc / num_val_batches
+                        avg_val_seq_acc_temp = val_seq_acc / num_val_batches
+                        
+                        pbar_val.set_postfix({
+                            "loss": f"{avg_val_loss_temp:.4f}",
+                            "tok_acc": f"{avg_val_token_acc_temp:.3f}",
+                            "seq_acc": f"{avg_val_seq_acc_temp:.3f}"
+                        })
+            
+            pbar_val.close()
+            
+            # Calculate final validation metrics
+            if num_val_batches > 0:
+                avg_val_loss = val_loss / num_val_batches
+                avg_val_token_acc = val_token_acc / num_val_batches
+                avg_val_seq_acc = val_seq_acc / num_val_batches
+            else:
+                avg_val_loss = avg_val_token_acc = avg_val_seq_acc = 0.0
+        
+        # Update metrics tracker for plotting later 
+        metrics_tracker.update(
+            epoch=epoch + 1,
+            train_loss=avg_train_loss,
+            train_token_acc=avg_train_token_acc,
+            train_seq_acc=avg_train_seq_acc,
+            val_loss=avg_val_loss,
+            val_token_acc=avg_val_token_acc,
+            val_seq_acc=avg_val_seq_acc,
+            lr=current_lr
+        )
+        
+        # Print epoch summary
+        if avg_val_loss is not None:
+            print(f"\n EPOCH {epoch+1} SUMMARY:")
+            print(f"Train: Loss: {avg_train_loss:.4f} | Token Acc: {avg_train_token_acc:.3f} | Seq Acc: {avg_train_seq_acc:.3f}")
+            print(f"Val: Loss: {avg_val_loss:.4f} | Token Acc: {avg_val_token_acc:.3f} | Seq Acc: {avg_val_seq_acc:.3f}")
+            print(f"LR: {current_lr:.2e}")
+            
+            # Check for best model
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                print(f"NEW BEST VALIDATION LOSS ({avg_val_loss:.4f})")
+            
+            # Generate example products
+            print(f"\n GENERATED EXAMPLES:")
+            generate_examples_during_training_with_visualization(model, val_dataset, tokenizer, num_examples=3)
+        else:
+            print(f"\n EPOCH {epoch+1} SUMMARY:")
+            print(f"Train: Loss: {avg_train_loss:.4f} | Token Acc: {avg_train_token_acc:.3f} | Seq Acc: {avg_train_seq_acc:.3f}")
+            print(f"LR: {current_lr:.2e}")
+        
+        # Plot metrics periodically
+        if (epoch + 1) % plot_freq == 0 or epoch == num_epochs - 1:
+            print(f"\n PLOTTING METRICS...")
+            if save_plots:
+                os.makedirs(plots_dir, exist_ok=True)
+                plot_path = os.path.join(plots_dir, f"metrics_epoch_{epoch+1}.png")
+                metrics_tracker.plot_metrics(save_path=plot_path)
+            else:
+                metrics_tracker.plot_metrics()
+        
+        print("=" * 80)
+    
+    print(f"\n TRAINING COMPLETED!")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    
+    # Final metrics summary and plots
+    print("\n" + "="*60)
+    print("FINAL TRAINING SUMMARY")
+    print("="*60)
+    metrics_tracker.print_summary()
+    
+    # Generate final comprehensive plots
+    if save_plots:
+        print(f"\nSaving final plots to {plots_dir}/...")
+        os.makedirs(plots_dir, exist_ok=True)
+        final_plot_path = os.path.join(plots_dir, "final_training_metrics.png")
+        metrics_tracker.plot_metrics(save_path=final_plot_path)
+        
+        # Also save individual plots
+        individual_plots_dir = os.path.join(plots_dir, "individual")
+        metrics_tracker.plot_individual_metrics(save_dir=individual_plots_dir)
+    else:
+        metrics_tracker.plot_metrics()
+    
+    return metrics_tracker
+
+
+def generate_examples_during_training_with_visualization(model: ReactionMD4, dataset, tokenizer, 
+                                                        num_examples: int = 3, 
+                                                        show_masked_state: bool = True):
+    """
+    Generate example products during training with visualization of initial masked state.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    
+    # Get some examples from the dataset
+    indices = torch.randperm(len(dataset))[:num_examples]
+    
+    with torch.no_grad():
+        for i, idx in enumerate(indices):
+            try:
+                sample = dataset[idx]
+                x_target = sample['x_target']
+                
+                # Decode the full target reaction
+                original_reaction = tokenizer.decode(x_target.tolist())
+                
+                # Parse reaction to extract components including class
+                parts_with_class = original_reaction.strip().split()
+                if len(parts_with_class) < 2:
+                    continue
+                    
+                reaction_class = parts_with_class[-1]
+                reaction_str = " ".join(parts_with_class[:-1])
+                
+                # Parse the reaction string
+                parts = reaction_str.split('>')
+                if len(parts) == 3 and parts[1] == "":
+                    reactants, true_product = parts[0], parts[2]
+                    agents = tokenizer.noagent_token
+                elif len(parts) == 3:
+                    reactants, agents, true_product = parts
+                elif len(parts) == 2:
+                    reactants, true_product = parts
+                    agents = tokenizer.noagent_token
+                else:
+                    continue
+                
+                # Generate product with visualization
+                if show_masked_state:
+                    generation_info = model.generate_product_with_visualization(
+                        reactants, agents, reaction_class, tokenizer, 
+                        num_steps=50, temperature=1.0, verbose=False
+                    )
+                    
+                    generated_product = generation_info['product']
+                    initial_sequence = generation_info['initial_sequence']
+                    final_sequence = generation_info['final_sequence']
+                    
+                    # Format output with visualization
+                    match_indicator = "✓ CORRECT" if generated_product.strip() == true_product.strip() else "✗ WRONG"
+                    
+                    print(f"\n{i+1}. Example Generation:")
+                    print(f"   Class: {reaction_class}")
+                    print(f"   Initial (masked): {initial_sequence}")
+                    print(f"   Final (complete): {final_sequence}")
+                    print(f"   True product:     {true_product}")
+                    print(f"   Generated:        {generated_product} {match_indicator}")
+                else:
+                    # Original behavior without visualization
+                    generated_product = model.generate_product_with_visualization(
+                        reactants, agents, reaction_class, tokenizer, 
+                        num_steps=50, temperature=1.0
+                    )
+                    
+                    reactants_agents_text = f"{reactants}>{agents}>" if agents else f"{reactants}>>"
+                    match_indicator = "match" if generated_product.strip() == true_product.strip() else "no match"
+                    
+                    print(f"{i+1}. {reactants_agents_text}")
+                    print(f"   True: {true_product}")
+                    print(f"   Gen:  {generated_product} {match_indicator}")
+                    
+            except Exception as e:
+                print(f"{i+1}. Error generating example: {str(e)}")
+    
+    model.train()
+
+
+@torch.no_grad()
+def test_model_with_visualization(model: ReactionMD4, test_dataset, tokenizer, 
+                                 batch_size: int = 32, num_steps: int = 100,
+                                 show_examples: int = 10):
+    """
+    Test the model with visualization of masked states for selected examples.
+    """
+    model.eval()
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    
+    all_token_accuracies = []
+    all_seq_accuracies = []
+    all_generated_products = []
+    all_true_products = []
+    all_inputs = []
+    visualization_examples = []
+    
+    print("Running comprehensive test evaluation with visualization...")
+    
+    for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="Testing")):
+        x_target = batch['x_target'][0]
+        
+        # Decode the full target reaction
+        original_reaction = tokenizer.decode(x_target.tolist())
+        
+        # Parse reaction to extract components including class
+        parts_with_class = original_reaction.strip().split()
+        if len(parts_with_class) < 2:
+            continue
+            
+        reaction_class = parts_with_class[-1]
+        reaction_str = " ".join(parts_with_class[:-1])
+        
+        # Parse the reaction string
+        parts = reaction_str.split('>')
+        if len(parts) == 3 and parts[1] == "":
+            reactants, true_product = parts[0], parts[2]
+            agents = tokenizer.noagent_token
+        elif len(parts) == 3:
+            reactants, agents, true_product = parts
+        elif len(parts) == 2:
+            reactants, true_product = parts
+            agents = tokenizer.noagent_token
+        else:
+            continue
+        
+        # Generate product with optional visualization for first few examples
+        if batch_idx < show_examples:
+            generation_info = model.generate_product_with_visualization(
+                reactants, agents, reaction_class, tokenizer, 
+                num_steps=num_steps, temperature=1.0, verbose=False
+            )
+            generated_product = generation_info['product']
+            
+            # Store visualization example
+            visualization_examples.append({
+                'idx': batch_idx,
+                'reactants': reactants,
+                'agents': agents,
+                'reaction_class': reaction_class,
+                'true_product': true_product.strip(),
+                'generated_product': generated_product.strip(),
+                'initial_sequence': generation_info['initial_sequence'],
+                'final_sequence': generation_info['final_sequence'],
+                'is_correct': generated_product.strip() == true_product.strip()
+            })
+        else:
+            # Regular generation without visualization for speed
+            generated_product = model.generate_product_with_visualization(
+                reactants, agents, reaction_class, tokenizer, 
+                num_steps=num_steps, temperature=1.0
+            )
+        
+        # Calculate accuracy
+        true_product_clean = true_product.strip()
+        generated_product_clean = generated_product.strip()
+        
+        if true_product_clean:
+            # Sequence accuracy (exact match)
+            seq_accuracy = 1.0 if generated_product_clean == true_product_clean else 0.0
+            
+            # Token-level accuracy
+            if generated_product_clean:
+                true_tokens = tokenizer.encode(true_product_clean)
+                gen_tokens = tokenizer.encode(generated_product_clean)
+                
+                max_len = max(len(true_tokens), len(gen_tokens))
+                true_padded = true_tokens + [tokenizer.pad_token_id] * (max_len - len(true_tokens))
+                gen_padded = gen_tokens + [tokenizer.pad_token_id] * (max_len - len(gen_tokens))
+                
+                correct_tokens = sum(1 for t, g in zip(true_padded, gen_padded) if t == g and t != tokenizer.pad_token_id)
+                total_tokens = len([t for t in true_tokens if t != tokenizer.pad_token_id])
+                token_accuracy = correct_tokens / max(total_tokens, 1)
+            else:
+                token_accuracy = 0.0
+            
+            all_token_accuracies.append(token_accuracy)
+            all_seq_accuracies.append(seq_accuracy)
+            all_inputs.append(original_reaction)
+            all_true_products.append(true_product_clean)
+            all_generated_products.append(generated_product_clean)
+        
+        if (batch_idx + 1) % 100 == 0:
+            print(f"  Processed {batch_idx + 1}/{len(test_dataloader)} samples")
+    
+    # Calculate final metrics
+    if all_token_accuracies:
+        final_token_acc = np.mean(all_token_accuracies)
+        final_seq_acc = np.mean(all_seq_accuracies)
+        
+        print(f"\n{'='*70}")
+        print("FINAL TEST RESULTS")
+        print(f"{'='*70}")
+        print(f"Token Accuracy: {final_token_acc:.4f}")
+        print(f"Sequence Accuracy: {final_seq_acc:.4f}")
+        print(f"Total Test Samples: {len(all_token_accuracies)}")
+        
+        # Show visualization examples
+        if visualization_examples:
+            print(f"\n{'='*70}")
+            print("DETAILED GENERATION EXAMPLES (showing masked → final)")
+            print(f"{'='*70}")
+            
+            for ex in visualization_examples[:5]:  # Show first 5
+                print(f"\nExample {ex['idx'] + 1}:")
+                print(f"  Reaction Class: {ex['reaction_class']}")
+                print(f"  Reactants: {ex['reactants']}")
+                print(f"  Agents: {ex['agents'] if ex['agents'] else '[NOAGENT]'}")
+                print(f"  -----------")
+                print(f"  Initial (masked): {ex['initial_sequence']}")
+                print(f"  Final (complete): {ex['final_sequence']}")
+                print(f"  -----------")
+                print(f"  True product:     {ex['true_product']}")
+                print(f"  Generated:        {ex['generated_product']}")
+                print(f"  Match: {'✓ CORRECT' if ex['is_correct'] else '✗ INCORRECT'}")
+        
+        return {
+            "token_accuracy": final_token_acc,
+            "sequence_accuracy": final_seq_acc,
+            "num_samples": len(all_token_accuracies),
+            "visualization_examples": visualization_examples,
+            "examples": {
+                "inputs": all_inputs[:10],
+                "true_products": all_true_products[:10],
+                "generated_products": all_generated_products[:10]
+            }
+        }
+    else:
+        print("No valid test samples found!")
+        return {"token_accuracy": 0.0, "sequence_accuracy": 0.0, "num_samples": 0}
+
+
+@dataclass
+class TrainingMetrics:
+    """Container for training metrics."""
+    epoch: int
+    train_loss: float
+    train_token_acc: float
+    train_seq_acc: float
+    val_loss: float = None
+    val_token_acc: float = None
+    val_seq_acc: float = None
+    learning_rate: float = None
+    timestamp: str = None
+    generated_examples: List[Dict] = None
+
+class MetricsTracker:
+    """Track and store training metrics with visualization."""
+    
+    def __init__(self, save_dir: str = "training_logs_fixed_ACC"):
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        
+        self.metrics_history = []
+        self.generated_examples_history = []
+        
+    def add_metrics(self, metrics: TrainingMetrics):
+        """Add metrics for current epoch."""
+        metrics.timestamp = datetime.now().isoformat()
+        self.metrics_history.append(metrics)
+        
+    def add_generated_examples(self, epoch: int, examples: List[Dict]):
+        """Add generated examples for current epoch."""
+        self.generated_examples_history.append({
+            "epoch": epoch,
+            "timestamp": datetime.now().isoformat(),
+            "examples": examples
+        })
+        
+    def plot_metrics(self, save_path: str = None):
+        """Create comprehensive training plots."""
+        if not self.metrics_history:
+            print("No metrics to plot!")
+            return
+            
+        # Extract data
+        epochs = [m.epoch for m in self.metrics_history]
+        train_losses = [m.train_loss for m in self.metrics_history]
+        train_token_accs = [m.train_token_acc for m in self.metrics_history]
+        train_seq_accs = [m.train_seq_acc for m in self.metrics_history]
+        
+        # Validation metrics (may be sparse)
+        val_epochs = [m.epoch for m in self.metrics_history if m.val_loss is not None]
+        val_losses = [m.val_loss for m in self.metrics_history if m.val_loss is not None]
+        val_token_accs = [m.val_token_acc for m in self.metrics_history if m.val_token_acc is not None]
+        val_seq_accs = [m.val_seq_acc for m in self.metrics_history if m.val_seq_acc is not None]
+        
+        # Create figure with subplots
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle('Training Metrics Dashboard', fontsize=16, fontweight='bold')
+        
+        # Plot 1: Loss
+        ax1.plot(epochs, train_losses, 'b-', label='Train Loss', linewidth=2, alpha=0.8)
+        if val_losses:
+            ax1.plot(val_epochs, val_losses, 'r-', label='Val Loss', linewidth=2, alpha=0.8, marker='o', markersize=4)
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.set_title('Training & Validation Loss')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Token Accuracy
+        ax2.plot(epochs, train_token_accs, 'b-', label='Train Token Acc', linewidth=2, alpha=0.8)
+        if val_token_accs:
+            ax2.plot(val_epochs, val_token_accs, 'r-', label='Val Token Acc', linewidth=2, alpha=0.8, marker='o', markersize=4)
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Token Accuracy')
+        ax2.set_title('Token-Level Accuracy')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax2.set_ylim(0, 1)
+        
+        # Plot 3: Sequence Accuracy
+        ax3.plot(epochs, train_seq_accs, 'b-', label='Train Seq Acc', linewidth=2, alpha=0.8)
+        if val_seq_accs:
+            ax3.plot(val_epochs, val_seq_accs, 'r-', label='Val Seq Acc', linewidth=2, alpha=0.8, marker='o', markersize=4)
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('Sequence Accuracy')
+        ax3.set_title('Sequence-Level Accuracy')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        ax3.set_ylim(0, 1)
+        
+        # Plot 4: Learning Rate
+        learning_rates = [m.learning_rate for m in self.metrics_history if m.learning_rate is not None]
+        if learning_rates:
+            lr_epochs = [m.epoch for m in self.metrics_history if m.learning_rate is not None]
+            ax4.plot(lr_epochs, learning_rates, 'g-', linewidth=2, alpha=0.8)
+            ax4.set_xlabel('Epoch')
+            ax4.set_ylabel('Learning Rate')
+            ax4.set_title('Learning Rate Schedule')
+            ax4.set_yscale('log')
+            ax4.grid(True, alpha=0.3)
+        else:
+            ax4.text(0.5, 0.5, 'No LR data', ha='center', va='center', transform=ax4.transAxes)
+            ax4.set_title('Learning Rate Schedule')
+        
+        plt.tight_layout()
+        
+        # Save plot
+        if save_path is None:
+            save_path = os.path.join(self.save_dir, f"training_metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+        
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Metrics plot saved to: {save_path}")
+        
+        # Also display
+        plt.show()
+        
+    def save_metrics_json(self, filename: str = None):
+        """Save all metrics to JSON file."""
+        if filename is None:
+            filename = os.path.join(self.save_dir, f"metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+            
+        # Convert to serializable format
+        metrics_data = []
+        for m in self.metrics_history:
+            metric_dict = {
+                "epoch": m.epoch,
+                "train_loss": m.train_loss,
+                "train_token_acc": m.train_token_acc,
+                "train_seq_acc": m.train_seq_acc,
+                "val_loss": m.val_loss,
+                "val_token_acc": m.val_token_acc,
+                "val_seq_acc": m.val_seq_acc,
+                "learning_rate": m.learning_rate,
+                "timestamp": m.timestamp
+            }
+            metrics_data.append(metric_dict)
+            
+        with open(filename, 'w') as f:
+            json.dump(metrics_data, f, indent=2)
+        print(f"Metrics saved to: {filename}")
+        
+    def save_generated_examples(self, filename: str = None):
+        """Save generated examples to JSON file."""
+        if filename is None:
+            filename = os.path.join(self.save_dir, f"generated_examples_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+            
+        with open(filename, 'w') as f:
+            json.dump(self.generated_examples_history, f, indent=2)
+        print(f"Generated examples saved to: {filename}")
+
+
+class GeneratedExampleSampler:
+    """Smart sampling of generated examples during training."""
+    
+    def __init__(self, total_dataset_size: int, max_examples_per_epoch: int = 50):
+        self.total_dataset_size = total_dataset_size
+        self.max_examples_per_epoch = max_examples_per_epoch
+        
+        # For 4.5M samples, this gives reasonable coverage
+        self.sampling_strategy = self._determine_sampling_strategy()
+        
+    def _determine_sampling_strategy(self):
+        """Determine optimal sampling strategy based on dataset size."""
+        if self.total_dataset_size < 10000:
+            return "random_subset"  # Small dataset - random sampling
+        elif self.total_dataset_size < 100000:
+            return "stratified"     # Medium dataset - stratified sampling
+        else:
+            return "systematic"     # Large dataset - systematic sampling
+            
+    def sample_indices(self, dataset_size: int, epoch: int) -> List[int]:
+        """Sample indices for generating examples."""
+        if self.sampling_strategy == "random_subset":
+            return random.sample(range(dataset_size), min(self.max_examples_per_epoch, dataset_size))
+        
+        elif self.sampling_strategy == "stratified":
+            # Sample from different parts of the dataset
+            n_samples = min(self.max_examples_per_epoch, dataset_size)
+            indices = []
+            for i in range(n_samples):
+                # Sample from different strata
+                stratum_idx = (i * dataset_size) // n_samples
+                offset = random.randint(0, dataset_size // n_samples - 1)
+                idx = min(stratum_idx + offset, dataset_size - 1)
+                indices.append(idx)
+            return indices
+            
+        else:  # systematic
+            # Systematic sampling with random start, rotated by epoch
+            step = max(1, dataset_size // self.max_examples_per_epoch)
+            start = (epoch * 17) % step  # Use prime number to avoid patterns
+            return list(range(start, dataset_size, step))[:self.max_examples_per_epoch]
+
+def enhanced_generate_examples_during_training(model, val_dataset, tokenizer, 
+                                             metrics_tracker, epoch, example_sampler,
+                                             num_examples: int = 50):
+    """Generate examples AND calculate true generation accuracy."""
+    
+    # Call your existing example generation function
+    generated_examples = generate_examples_during_training_enhanced(
+        model, val_dataset, tokenizer, metrics_tracker, epoch, 
+        example_sampler, num_examples
+    )
+    
+    # ADD: Calculate actual generation accuracy on a separate set of samples
+    print(f"\n CALCULATING TRUE GENERATION ACCURACY...")
+    gen_results = calculate_generation_accuracy(
+        model, val_dataset, tokenizer, num_samples=25  # Smaller sample for speed
+    )
+    
+    print(f"      TRUE Generation Accuracy: {gen_results['generation_accuracy']:.3f}")
+    print(f"      Correct: {gen_results['correct_samples']}/{gen_results['total_samples']}")
+    
+    return gen_results
+
+def generate_examples_during_training_enhanced(model, dataset, tokenizer, 
+                                             metrics_tracker: MetricsTracker,
+                                             epoch: int, sampler: GeneratedExampleSampler,
+                                             num_examples: int = 50):
+    """Enhanced example generation with intelligent sampling and storage."""
+    model.eval()
+    device = next(model.parameters()).device
+    
+    # Get sample indices using smart sampling
+    sample_indices = sampler.sample_indices(len(dataset), epoch)[:num_examples]
+    
+    generated_examples = []
+    
+    with torch.no_grad():
+        for i, idx in enumerate(sample_indices):
+            try:
+                sample = dataset[idx]
+                x_target = sample['x_target']
+                
+                # Decode the full target reaction
+                original_reaction = tokenizer.decode(x_target.tolist())
+                
+                # Parse reaction to extract reactants and agents
+                parts = original_reaction.split('>')
+                if len(parts) == 3 and parts[1] == "":
+                    reactants, true_product = parts[0], parts[2]
+                    agents = tokenizer.noagent_token
+                elif len(parts) == 3:
+                    reactants, agents, true_product = parts
+                elif len(parts) == 2:
+                    reactants, true_product = parts
+                    agents = tokenizer.noagent_token
+                else:
+                    continue
+                """ if len(parts) >= 3:
+                    reactants = parts[0]
+                    agents = parts[1] if parts[1] else ""
+                    true_product = parts[2]
+                elif len(parts) == 2:
+                    reactants = parts[0]
+                    agents = ""
+                    true_product = parts[1]
+                else:
+                    continue """
+                
+                # Generate product with different temperatures for diversity
+                temperatures = [0.8, 1.0, 1.2]
+                generated_variants = []
+                
+                for temp in temperatures:
+                    generated_product = model.generate_product_with_visualization(
+                        reactants, agents, tokenizer, num_steps=50, temperature=temp
+                    )
+                    generated_variants.append({
+                        "temperature": temp,
+                        "product": generated_product.strip(),
+                        "is_correct": generated_product.strip() == true_product.strip()
+                    })
+                
+                # Store example
+                example_data = {
+                    "sample_idx": idx,
+                    "reactants": reactants,
+                    "agents": agents,
+                    "true_product": true_product.strip(),
+                    "generated_variants": generated_variants,
+                    "input_format": f"{reactants}>{agents}>" if agents else f"{reactants}>>"
+                }
+                
+                generated_examples.append(example_data)
+                
+                # Print first few examples for monitoring
+                if i < 3:
+                    reactants_agents_text = f"{reactants}>{agents}>" if agents else f"{reactants}>>"
+                    best_match = max(generated_variants, key=lambda x: x["is_correct"])
+                    match_indicator = "✓" if best_match["is_correct"] else "✗"
+                    
+                    print(f"      {i+1}. {reactants_agents_text}")
+                    print(f"         True:      {true_product}")
+                    print(f"         Generated: {best_match['product']} {match_indicator}")
+                    if i < 2:
+                        print()
+                        
+            except Exception as e:
+                print(f"      Error generating example {i+1}: {str(e)}")
+    
+    # Add to metrics tracker
+    metrics_tracker.add_generated_examples(epoch, generated_examples)
+    
+    # Calculate summary statistics
+    correct_any_temp = sum(1 for ex in generated_examples 
+                          if any(var["is_correct"] for var in ex["generated_variants"]))
+    
+    print(f"      Generated {len(generated_examples)} examples")
+    print(f"      Correct products (any temp): {correct_any_temp}/{len(generated_examples)} ({100*correct_any_temp/max(len(generated_examples),1):.1f}%)")
+    
+    model.train()
+    return generated_examples
+
+
+def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
+                               num_epochs: int = 10, batch_size: int = 32,
+                               learning_rate: float = 1e-4, validation_freq: int = 1,
+                               save_dir: str = "training_logs_fixed_ACC",
+                               examples_per_epoch: int = 50):
+    """Enhanced training loop with comprehensive metrics tracking."""
+    
+    device = next(model.parameters()).device
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs * len(train_dataloader))
+    
+    # Initialize tracking
+    metrics_tracker = MetricsTracker(save_dir)
+    example_sampler = GeneratedExampleSampler(len(train_dataset), examples_per_epoch)
+    
+    best_val_loss = float('inf')
+    
+    print(f"Starting enhanced training for {num_epochs} epochs...")
+    print(f"Train batches: {len(train_dataloader)}, Val batches: {len(val_dataloader)}")
+    print(f"Saving metrics and examples to: {save_dir}")
+    print(f"Examples per epoch: {examples_per_epoch}")
+    print("=" * 80)
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0
+        train_token_acc = 0
+        train_seq_acc = 0
+        num_successful_batches = 0
+        
+        pbar_train = tqdm(
+            train_dataloader, 
+            desc=f"Epoch {epoch+1}/{num_epochs} [Training]",
+            ncols=120,
+            leave=True,
+            position=0
+        )
+        
+        for batch_idx, batch in enumerate(pbar_train):
+            x_masked = batch['x_masked'].to(device)
+            x_target = batch['x_target'].to(device) 
+            product_mask = batch['product_mask'].to(device)
+            
+            batch_size_curr = x_masked.shape[0]
+            
+            # Sample random time steps
+            t = torch.rand(batch_size_curr, device=device)
+            
+            # Forward diffusion (add noise to target based on schedule)
+            x_noisy = model.forward_sample(x_target, t, product_mask)
+            
+            # Forward pass
+            outputs = model(x_noisy, t, x_target, product_mask, tokenizer=tokenizer)
+            loss = outputs.get('loss', torch.tensor(0.0, device=device, requires_grad=True))
+            
+            # Skip if no valid loss
+            if loss.item() <= 0 or not loss.requires_grad:
+                continue
+            
+            # Calculate accuracy
+            """ if product_mask.any():
+                with torch.no_grad():
+                    logits = outputs["logits"]
+                    predictions = torch.argmax(logits, dim=-1)
+                    acc_metrics = calculate_accuracy(predictions, x_target, product_mask, model.config.pad_token_id)
+                    train_token_acc += acc_metrics["token_accuracy"]
+                    train_seq_acc += acc_metrics["sequence_accuracy"] """
+            if product_mask.any():
+                with torch.no_grad():
+                    logits = outputs["logits"]
+                    predictions = torch.argmax(logits, dim=-1)
+                    
+                    # Use the fixed accuracy calculation that considers what was actually masked
+                    acc_metrics = calculate_accuracy_fixed(
+                        predictions, x_target, product_mask, 
+                        model.config.pad_token_id, x_noisy, model.config.mask_token_id
+                    )
+                    train_token_acc += acc_metrics["token_accuracy"]
+                    train_seq_acc += acc_metrics["sequence_accuracy"]
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            train_loss += loss.item()
+            num_successful_batches += 1
+            
+            # Update progress bar
+            if num_successful_batches > 0:
+                avg_train_loss = train_loss / num_successful_batches
+                avg_token_acc = train_token_acc / num_successful_batches
+                avg_seq_acc = train_seq_acc / num_successful_batches
+                
+                pbar_train.set_postfix({
+                    "loss": f"{avg_train_loss:.4f}",
+                    "tok_acc": f"{avg_token_acc:.3f}",
+                    "seq_acc": f"{avg_seq_acc:.3f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.2e}"
+                })
+        
+        pbar_train.close()
+        
+        # Calculate final training metrics
+        if num_successful_batches > 0:
+            avg_train_loss = train_loss / num_successful_batches
+            avg_train_token_acc = train_token_acc / num_successful_batches
+            avg_train_seq_acc = train_seq_acc / num_successful_batches
+        else:
+            avg_train_loss = avg_train_token_acc = avg_train_seq_acc = 0.0
+        
+        # Create metrics object
+        epoch_metrics = TrainingMetrics(
+            epoch=epoch + 1,
+            train_loss=avg_train_loss,
+            train_token_acc=avg_train_token_acc,
+            train_seq_acc=avg_train_seq_acc,
+            learning_rate=scheduler.get_last_lr()[0]
+        )
+
+        # Add debugging for performance
+        if batch_idx % 100 == 0 and product_mask.any():  # Debug every 100 batches
+            with torch.no_grad():
+                # Check first sample in batch
+                first_target = x_target[0]
+                first_noisy = x_noisy[0] 
+                first_product_mask = product_mask[0]
+                first_predictions = torch.argmax(outputs["logits"][0], dim=-1)
+                
+                # Count what was actually masked 
+                actually_masked = (first_noisy == model.config.mask_token_id) & first_product_mask
+                total_product_tokens = first_product_mask.sum().item()
+                masked_tokens = actually_masked.sum().item()
+                
+                print(f"\n    DEBUG Batch {batch_idx}:")
+                print(f"      Product tokens total: {total_product_tokens}")
+                print(f"      Actually masked: {masked_tokens}")
+                print(f"      Masking ratio: {masked_tokens/max(total_product_tokens,1):.2f}")
+                
+                # Show actual sequences
+                target_str = tokenizer.decode(first_target.tolist())
+                noisy_str = tokenizer.decode(first_noisy.tolist())
+                pred_str = tokenizer.decode(first_predictions.tolist())
+                
+                print(f"      Target: {target_str}")
+                print(f"      Noisy:  {noisy_str}")  
+                print(f"      Pred:   {pred_str}")
+        
+        # Validation phase
+        if (epoch + 1) % validation_freq == 0:
+            model.eval()
+            val_loss = 0
+            val_token_acc = 0
+            val_seq_acc = 0
+            num_val_batches = 0
+            
+            pbar_val = tqdm(
+                val_dataloader, 
+                desc=f"Epoch {epoch+1}/{num_epochs} [Validation]",
+                ncols=120,
+                leave=True,
+                position=0
+            )
+            
+            with torch.no_grad():
+                for batch in pbar_val:
+                    x_masked = batch['x_masked'].to(device)
+                    x_target = batch['x_target'].to(device)
+                    product_mask = batch['product_mask'].to(device)
+                    
+                    batch_size_curr = x_masked.shape[0]
+                    
+                    # Sample random time steps for validation
+                    t = torch.rand(batch_size_curr, device=device)
+                    
+                    # Forward diffusion
+                    x_noisy = model.forward_sample(x_target, t, product_mask)
+                    
+                    # Forward pass
+                    outputs = model(x_noisy, t, x_target, product_mask, tokenizer=tokenizer)
+                    loss = outputs.get('loss', torch.tensor(0.0, device=device))
+                    
+                    # Calculate accuracy
+                    """ if product_mask.any():
+                        logits = outputs["logits"]
+                        predictions = torch.argmax(logits, dim=-1)
+                        acc_metrics = calculate_accuracy(predictions, x_target, product_mask, model.config.pad_token_id)
+                        val_token_acc += acc_metrics["token_accuracy"]
+                        val_seq_acc += acc_metrics["sequence_accuracy"] """
+                    if product_mask.any():
+                        with torch.no_grad():
+                            logits = outputs["logits"]
+                            predictions = torch.argmax(logits, dim=-1)
+                            
+                            # Use the fixed accuracy calculation
+                            acc_metrics = calculate_accuracy_fixed(
+                                predictions, x_target, product_mask, 
+                                model.config.pad_token_id, x_noisy, model.config.mask_token_id
+                            )
+                            val_token_acc += acc_metrics["token_accuracy"]
+                            val_seq_acc += acc_metrics["sequence_accuracy"]
+                    
+                    val_loss += loss.item()
+                    num_val_batches += 1
+                    
+                    # Update validation progress bar
+                    if num_val_batches > 0:
+                        avg_val_loss = val_loss / num_val_batches
+                        avg_val_token_acc = val_token_acc / num_val_batches
+                        avg_val_seq_acc = val_seq_acc / num_val_batches
+                        
+                        pbar_val.set_postfix({
+                            "loss": f"{avg_val_loss:.4f}",
+                            "tok_acc": f"{avg_val_token_acc:.3f}",
+                            "seq_acc": f"{avg_val_seq_acc:.3f}"
+                        })
+            
+            pbar_val.close()
+            
+            # Update metrics with validation results
+            if num_val_batches > 0:
+                epoch_metrics.val_loss = val_loss / num_val_batches
+                epoch_metrics.val_token_acc = val_token_acc / num_val_batches
+                epoch_metrics.val_seq_acc = val_seq_acc / num_val_batches
+            
+            # Print epoch summary
+            print(f"\n EPOCH {epoch+1} SUMMARY:")
+            print(f"Training: Loss: {avg_train_loss:.4f} | Token Acc: {avg_train_token_acc:.3f} | Seq Acc: {avg_train_seq_acc:.3f}")
+            print(f"Validation: Loss: {epoch_metrics.val_loss:.4f} | Token Acc: {epoch_metrics.val_token_acc:.3f} | Seq Acc: {epoch_metrics.val_seq_acc:.3f}")
+            print(f"LR: {scheduler.get_last_lr()[0]:.2e}")
+            
+            # Check for best model
+            if epoch_metrics.val_loss < best_val_loss:
+                best_val_loss = epoch_metrics.val_loss
+                print(f"NEW BEST VALIDATION LOSS! ({epoch_metrics.val_loss:.4f})")
+                
+                # Save best model
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'config': model.config,
+                    'val_loss': best_val_loss,
+                    'metrics_history': metrics_tracker.metrics_history
+                }, os.path.join(save_dir, 'best_model.pt'))
+            
+            # Generate examples and store them
+            """ print(f"\n GENERATED EXAMPLES:")
+            generate_examples_during_training_enhanced(
+                model, val_dataset, tokenizer, metrics_tracker, epoch + 1, 
+                example_sampler, examples_per_epoch
+            )
+             """
+            print(f"\n GENERATED EXAMPLES:")
+            gen_results = enhanced_generate_examples_during_training(
+                model, val_dataset, tokenizer, metrics_tracker, epoch + 1, 
+                example_sampler, examples_per_epoch
+            )
+        else:
+            print(f"\n EPOCH {epoch+1} SUMMARY:")
+            print(f"Train: Loss: {avg_train_loss:.4f} | Token Acc: {avg_train_token_acc:.3f} | Seq Acc: {avg_train_seq_acc:.3f}")
+            print(f"LR: {scheduler.get_last_lr()[0]:.2e}")
+        
+        # Add metrics to tracker
+        metrics_tracker.add_metrics(epoch_metrics)
+        
+        # Save metrics periodically
+        if (epoch + 1) % 5 == 0:
+            metrics_tracker.save_metrics_json()
+            metrics_tracker.save_generated_examples()
+            
+        # Plot metrics periodically
+        if (epoch + 1) % 5 == 0:
+            metrics_tracker.plot_metrics()
+            
+        print("=" * 80)
+    
+    print(f"\n TRAINING COMPLETED!")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    
+    # Final saves
+    metrics_tracker.save_metrics_json()
+    metrics_tracker.save_generated_examples()
+    
+    # Final comprehensive plot
+    print("\n Creating final metrics visualization...")
+    metrics_tracker.plot_metrics(os.path.join(save_dir, "final_training_metrics.png"))
+    
+    return metrics_tracker
+
+
+# Example usage and main training script
+if __name__ == "__main__":
+    
+    # Load your data
+    print("Loading reaction data...")
+    with open("/home/gpwuq/ipms-foundation_model/data/interim/clean_corpus_reactions_and_classes.txt") as f:
+        reactions = [line.strip() for line in f if line.strip()]
+    
+    print(f"Loaded {len(reactions)} reactions")
+    
+    # Initialize tokenizer
+    tokenizer = CustomTokenizer("/home/gpwuq/ipms-foundation_model/data/interim/clean_vocab_reactions_and_classes_combined.json")
+    
+    # Configuration
+    config = ReactionMD4Config(
+        vocab_size=len(tokenizer.vocab),
+        max_seq_length=230,
+        d_model=512,
+        n_layers=6,
+        n_heads=8,
+        d_ff=2048,
+        dropout=0.1,
+        max_product_tokens=82,
+        reactant_sep_token_id=25,
+        pad_token_id=0,
+        eos_token_id=tokenizer.eos_token_id,
+        noagent_token_id=tokenizer.noagent_token_id,
+        noise_schedule="cosine",
+        timesteps=1000
+    )
+    
+    print(f"\nUsing configuration:")
+    print(f"  max_seq_length: {config.max_seq_length}")
+    print(f"  max_product_tokens: {config.max_product_tokens}")
+    print(f"  vocab_size: {config.vocab_size}")
+    print(f"  noise_schedule: {config.noise_schedule}")
+    
+    # Shuffle and split data
+    random.shuffle(reactions)
+    
+    train_size = int(0.8 * len(reactions))
+    val_size = int(0.1 * len(reactions))
+    
+    train_data = reactions[:train_size]
+    val_data = reactions[train_size:train_size+val_size]
+    test_data = reactions[train_size+val_size:]
+    
+    print(f"\nData split:")
+    print(f"  Train: {len(train_data):,} samples")
+    print(f"  Val: {len(val_data):,} samples") 
+    print(f"  Test: {len(test_data):,} samples")
+    
+    # Initialize model
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    model = ReactionMD4(config).to(device)
+    
+    # Create datasets
+    train_dataset = ReactionDataset(train_data, tokenizer, config)
+    val_dataset = ReactionDataset(val_data, tokenizer, config)
+    test_dataset = ReactionDataset(test_data, tokenizer, config)
+    
+    examples_per_epoch = 75
+    num_epochs = 10
+    
+    print(f"\nTraining configuration:")
+    print(f"  Examples per epoch: {examples_per_epoch}")
+    print(f"  Total examples over training: ~{examples_per_epoch * num_epochs}")
+    print(f"  Storage strategy: Systematic sampling with rotation")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"\nModel initialized:")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    print(f"  Model size: ~{total_params * 4 / 1024**2:.1f} MB")
+    
+    # Training
+    print(f"\nStarting training...")
+    
+    # Enhanced training with metrics tracking
+    metrics_tracker = train_reaction_md4_enhanced(
+        model=model,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        tokenizer=tokenizer,
+        num_epochs=20,
+        batch_size=32,
+        learning_rate=1e-4,
+        validation_freq=1,
+        save_dir="training_logs_basic_diffusion_model_with_reaction_class_tracking",
+        examples_per_epoch=examples_per_epoch
+    )
+    
+    print("\n Training complete! Check 'training_logs' directory for:")
+    print("  - training_metrics_*.png: Comprehensive plots")
+    print("  - metrics_*.json: Raw metrics data")
+    print("  - generated_examples_*.json: Generated examples")
+    print("  - best_model.pt: Best model checkpoint")
+    
+    # Final test evaluation
+    print("\n" + "="*80)
+    print("RUNNING FINAL TEST EVALUATION")
+    print("="*80)
+    
+    test_results = test_model_with_visualization(
+        model=model,
+        test_dataset=test_dataset,
+        tokenizer=tokenizer,
+        batch_size=32,
+        num_steps=100
+    )
+    
+    print(f"\n TRAINING COMPLETED!")
+    print(f"Final test token accuracy: {test_results['token_accuracy']:.4f}")
+    print(f"Final test sequence accuracy: {test_results['sequence_accuracy']:.4f}")
+    
+    # Optional: Save the trained model
+    # torch.save({
+    #     'model_state_dict': model.state_dict(),
+    #     'config': config,
+    #     'test_results': test_results
+    # }, 'reaction_md4.pt')
+    # print("Model saved as 'reaction_md4.pt'")
+
+    metrics_tracker.plot_metrics(save_path="final_metrics_fixed_ACC.png")
+    metrics_tracker.plot_individual_metrics(save_dir="individual_plots_fixed_ACC")
