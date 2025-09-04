@@ -842,62 +842,62 @@ class ReactionMD4(nn.Module):
             'product_start_indices': product_starts
         }
     
-def generate_product_with_visualization(self, reactants: str, agents: str, reaction_class: str, 
-                                       tokenizer, num_steps: int = 100, temperature: float = 1.0,
-                                       conditioning_strategy: str = "dual",
-                                       verbose: bool = True) -> Dict[str, str]:
-    """
-    Generate a single reaction product with visualization of the generation process.
-    
-    Args:
-        reactants: Reactant SMILES string
-        agents: Agent SMILES string (can be empty)
-        reaction_class: Reaction class string
-        tokenizer: CustomTokenizer instance
-        num_steps: Number of diffusion steps
-        temperature: Sampling temperature
-        conditioning_strategy: How to place class tokens
-        verbose: If True, print the generation process
+    def generate_product_with_visualization(self, reactants: str, agents: str, reaction_class: str, 
+                                        tokenizer, num_steps: int = 100, temperature: float = 1.0,
+                                        conditioning_strategy: str = "dual",
+                                        verbose: bool = True) -> Dict[str, str]:
+        """
+        Generate a single reaction product with visualization of the generation process.
         
-    Returns:
-        Dictionary containing:
-        - 'product': Generated product SMILES
-        - 'initial_sequence': Initial masked sequence
-        - 'final_sequence': Final complete sequence
-        - 'generation_info': Additional information about the generation
-    """
-    results = self.sample_with_visualization(
-        [reactants], [agents], [reaction_class], tokenizer, 
-        num_steps, temperature, conditioning_strategy, return_initial_state=True
-    )
-    
-    generated_product = ""
-    if results['generated_products'] and len(results['generated_products'][0]) > 0:
-        product_tokens = results['generated_products'][0].cpu().tolist()
-        generated_product = tokenizer.decode(product_tokens)
-    
-    generation_info = {
-        'product': generated_product,
-        'initial_sequence': results['initial_sequences'][0] if results['initial_sequences'] else "",
-        'final_sequence': results['final_sequences'][0] if results['final_sequences'] else "",
-        'product_start_idx': results['product_start_indices'][0] if results['product_start_indices'] else 0
-    }
-    
-    if verbose:
-        print("\n" + "="*60)
-        print("GENERATION PROCESS VISUALIZATION")
-        print("="*60)
-        print(f"Reactants: {reactants}")
-        print(f"Agents: {agents if agents else '[NOAGENT]'}")
-        print(f"Reaction Class: {reaction_class}")
-        print(f"Product starts at position: {generation_info['product_start_idx']}")
-        print("-"*60)
-        print(f"Initial (masked): {generation_info['initial_sequence']}")
-        print(f"Final (complete): {generation_info['final_sequence']}")
-        print(f"Generated product: {generation_info['product']}")
-        print("="*60)
-    
-    return generation_info
+        Args:
+            reactants: Reactant SMILES string
+            agents: Agent SMILES string (can be empty)
+            reaction_class: Reaction class string
+            tokenizer: CustomTokenizer instance
+            num_steps: Number of diffusion steps
+            temperature: Sampling temperature
+            conditioning_strategy: How to place class tokens
+            verbose: If True, print the generation process
+            
+        Returns:
+            Dictionary containing:
+            - 'product': Generated product SMILES
+            - 'initial_sequence': Initial masked sequence
+            - 'final_sequence': Final complete sequence
+            - 'generation_info': Additional information about the generation
+        """
+        results = self.sample_with_visualization(
+            [reactants], [agents], [reaction_class], tokenizer, 
+            num_steps, temperature, conditioning_strategy, return_initial_state=True
+        )
+        
+        generated_product = ""
+        if results['generated_products'] and len(results['generated_products'][0]) > 0:
+            product_tokens = results['generated_products'][0].cpu().tolist()
+            generated_product = tokenizer.decode(product_tokens)
+        
+        generation_info = {
+            'product': generated_product,
+            'initial_sequence': results['initial_sequences'][0] if results['initial_sequences'] else "",
+            'final_sequence': results['final_sequences'][0] if results['final_sequences'] else "",
+            'product_start_idx': results['product_start_indices'][0] if results['product_start_indices'] else 0
+        }
+        
+        if verbose:
+            print("\n" + "="*60)
+            print("GENERATION PROCESS VISUALIZATION")
+            print("="*60)
+            print(f"Reactants: {reactants}")
+            print(f"Agents: {agents if agents else '[NOAGENT]'}")
+            print(f"Reaction Class: {reaction_class}")
+            print(f"Product starts at position: {generation_info['product_start_idx']}")
+            print("-"*60)
+            print(f"Initial (masked): {generation_info['initial_sequence']}")
+            print(f"Final (complete): {generation_info['final_sequence']}")
+            print(f"Generated product: {generation_info['product']}")
+            print("="*60)
+        
+        return generation_info
 
 class ReactionDataset(Dataset):
     """Dataset for reaction SMILES strings."""
