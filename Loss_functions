@@ -1,0 +1,570 @@
+import torch
+import torch.nn.functional as F
+from typing import Dict, Tuple, Optional
+
+class ELBOLoss:
+    """
+    ELBO Loss implementation for discrete masked diffusion with importance sampling.
+    Includes numerical stability improvements and proper masked position handling.
+    
+    Based on D3PM (Austin et al., 2021) with improvements for stability.
+    """
+    
+    def __init__(self, config):
+        """
+        Args:
+            config: Config object with attributes:
+                - timesteps: int
+                - mask_token_id: int
+                - pad_token_id: int
+                - noise_schedule: str ("linear", "cosine", "geometric")
+        """
+        self.config = config
+        self.mask_token_id = config.mask_token_id
+        self.pad_token_id = config.pad_token_id
+        self.timesteps = config.timesteps
+        
+        # Pre-compute alpha schedule
+        self.alphas = self._build_alpha_schedule()
+        
+        # Pre-compute weights and sampling distribution
+        self.weights, self.sampling_probs = self._compute_weights_and_sampling_probs()
+        
+    def _build_alpha_schedule(self) -> torch.Tensor:
+        """
+        Build alpha schedule based on config.
+        Returns tensor of shape (timesteps + 1,) where alpha[0] = 1.0
+        """
+        t = torch.linspace(0, 1, self.timesteps + 1)
+        
+        if self.config.noise_schedule == "linear":
+            alphas = 1 - t
+        elif self.config.noise_schedule == "cosine":
+            alphas = torch.cos(torch.pi / 2 * t)
+        elif self.config.noise_schedule == "geometric":
+            beta_min, beta_max = 1e-5, 20
+            alphas = torch.exp(-beta_min * (1-t) * beta_max**t)
+        else:
+            # Default to cosine
+            alphas = torch.cos(torch.pi / 2 * t)
+        
+        # Ensure alpha[0] = 1.0 (no noise at t=0)
+        alphas[0] = 1.0
+        
+        return alphas
+    
+    def _compute_weights_and_sampling_probs(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute ELBO weights w(t) and importance sampling distribution q(t).
+        
+        w(t) = (alpha_{t-1} - alpha_t) / (1 - alpha_t)
+        q(t) ∝ w(t) for variance reduction
+        
+        Returns:
+            weights: Shape (timesteps,) - the w(t) values
+            sampling_probs: Shape (timesteps,) - the q(t) probabilities
+        """
+        # Initialize array to store weight for each timestep
+        T = self.timesteps
+        weights = torch.zeros(T)
+        
+        # For each timestep, get current and previous alpha values
+        for t in range(1, T + 1):
+            alpha_t = self.alphas[t]
+            alpha_s = self.alphas[t - 1]
+            
+            # Add epsilon to denominator for numerical stability (prevent division by 0 for alpha_t=1)
+            denominator = 1.0 - alpha_t + 1e-8
+            
+            # Compute weight with clamping for stability
+            w_t = (alpha_s - alpha_t) / denominator
+            w_t = torch.clamp(w_t, min=0.0, max=100.0)  # Prevent extreme weights
+            # store weights
+            weights[t - 1] = w_t
+        
+        # Handle edge cases for sampling distribution
+        if torch.sum(weights) <= 0:
+            # Fallback to uniform sampling if weights are invalid
+            sampling_probs = torch.ones_like(weights) / len(weights)
+        else:
+            # Normalize weights to get sampling probabilities
+            sampling_probs = weights / torch.sum(weights)
+            # Add small epsilon for numerical stability
+            sampling_probs = sampling_probs + 1e-10
+            sampling_probs = sampling_probs / torch.sum(sampling_probs)
+        
+        return weights, sampling_probs
+    
+    def compute_elbo_loss(
+        self,
+        model=None,
+        x_target: torch.Tensor = None,
+        product_mask: torch.Tensor = None,
+        use_importance_sampling: bool = True,
+        # For testing - allow precomputed values
+        precomputed_logits: torch.Tensor = None,
+        precomputed_t: torch.Tensor = None,
+        precomputed_x_noisy: torch.Tensor = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute ELBO loss with importance sampling.
+        
+        Args:
+            model: The diffusion model (optional if precomputed_logits provided)
+            x_target: Original sequence [batch, seq_len]
+            product_mask: Boolean mask for product positions [batch, seq_len]
+            use_importance_sampling: Whether to use importance sampling for variance reduction
+            precomputed_logits: For testing - pre-computed model outputs
+            precomputed_t: For testing - pre-computed timesteps
+            precomputed_x_noisy: For testing - pre-computed noisy sequences
+            
+        Returns:
+            Dictionary containing loss and diagnostic information
+        """
+        batch_size, seq_len = x_target.shape
+        device = x_target.device
+        
+        # Move precomputed values to device if needed
+        alphas = self.alphas.to(device)
+        weights = self.weights.to(device)
+        sampling_probs = self.sampling_probs.to(device)
+        
+        # Use precomputed or sample timesteps
+        if precomputed_t is not None:
+            t = precomputed_t
+            # Convert continuous t to indices if needed
+            if t.max() <= 1.0:
+                t_indices = (t * self.timesteps).long().clamp(1, self.timesteps)
+            else:
+                t_indices = t.long()
+        else:
+            # Sample timesteps
+            if use_importance_sampling:
+                # Sample according to importance distribution q(t)
+                t_indices = torch.multinomial(sampling_probs, batch_size, replacement=True)
+                t_indices = t_indices + 1  # Shift from 0-indexed to 1-indexed
+            else:
+                # Uniform sampling
+                t_indices = torch.randint(1, self.timesteps + 1, (batch_size,), device=device)
+            
+            # Convert to normalized timesteps for model
+            t = t_indices.float() / self.timesteps
+        
+        # Get importance weights
+        if use_importance_sampling:
+            w_t = weights[t_indices - 1]
+            q_t = sampling_probs[t_indices - 1]
+            importance_weights = w_t / (q_t + 1e-12)
+        else:
+            w_t = weights[t_indices - 1]
+            importance_weights = self.timesteps * w_t
+        
+        # Use precomputed or generate noisy sequence
+        if precomputed_x_noisy is not None:
+            x_noisy = precomputed_x_noisy
+        else:
+            # Get alpha values for forward sampling
+            alpha_t = alphas[t_indices]
+            
+            # Forward sample with proper masking
+            mask_prob = torch.rand_like(x_target, dtype=torch.float32)
+            should_mask = (mask_prob > alpha_t.unsqueeze(-1)) & product_mask
+            x_noisy = torch.where(should_mask, self.mask_token_id, x_target)
+        
+        # Use precomputed or get model predictions
+        if precomputed_logits is not None:
+            logits = precomputed_logits
+        else:
+            if model is None:
+                raise ValueError("Either model or precomputed_logits must be provided")
+            outputs = model(x_noisy, t)
+            logits = outputs["logits"]
+        
+        # Compute loss only on actually masked positions
+        is_masked = (x_noisy == self.mask_token_id)
+        is_not_padding = (x_target != self.pad_token_id)
+        valid_positions = product_mask & is_masked & is_not_padding
+        
+        # Check if we have any valid positions
+        if not valid_positions.any():
+            print("t dtype:", t.dtype)
+            return {
+                "loss": torch.tensor(0.0, device=device, requires_grad=True),
+                "num_masked_tokens": 0,
+                "mean_importance_weight": 0.0,
+                "t_mean": t.float().mean().item()
+            }
+        
+        # Compute cross-entropy only on valid positions
+        logits_flat = logits.reshape(-1, logits.size(-1))
+        targets_flat = x_target.reshape(-1)
+        valid_flat = valid_positions.reshape(-1)
+        
+        # Get valid logits and targets
+        valid_logits = logits_flat[valid_flat]
+        valid_targets = targets_flat[valid_flat]
+        
+        # Compute token-level loss
+        token_losses = F.cross_entropy(valid_logits, valid_targets, reduction='none')
+        
+        # Map losses back to batch dimension
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, seq_len)
+        batch_indices_flat = batch_indices.reshape(-1)[valid_flat]
+        
+        # Aggregate losses per example
+        per_example_loss = torch.zeros(batch_size, device=device)
+        per_example_loss.index_add_(0, batch_indices_flat, token_losses)
+        
+        # Count valid tokens per example
+        valid_counts = torch.zeros(batch_size, device=device)
+        ones = torch.ones_like(token_losses)
+        valid_counts.index_add_(0, batch_indices_flat, ones)
+        
+        # Apply importance weights
+        weighted_loss = importance_weights * per_example_loss
+        
+        # Final loss is mean over batch
+        print("weighted loss dtype:", weighted_loss.dtype)
+        loss = weighted_loss.mean()
+        print("importance weights dtype:", importance_weights.dtype)
+
+        return {
+            "loss": loss,
+            "num_masked_tokens": valid_positions.sum().item(),
+            "mean_importance_weight": importance_weights.mean().item(),
+            "t_mean": t.float().mean().item(),
+            "per_example_loss": per_example_loss.detach(),
+            "valid_tokens_per_example": valid_counts.detach()
+        }
+    
+"""
+Implementation of NELBO from MDLM paper equation (47).
+This shows how the complex NELBO simplifies to a weighted cross-entropy.
+"""
+
+class MDLM_NELBO:
+    """
+    NELBO implementation from the MDLM paper.
+    
+    The paper shows that the NELBO simplifies to:
+    NELBO = E_{q,t}[α'_t/(1-α_t) * log(x_θ(z_t^ℓ, t), x^ℓ)]
+    
+    Where:
+    - α_t is the masking schedule (probability of NOT masking)
+    - α'_t is the derivative of α_t with respect to t
+    - z_t is the noisy/masked sequence at time t
+    - x_θ is the model's prediction
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self.mask_token_id = config.mask_token_id
+        self.pad_token_id = config.pad_token_id
+        self.num_timesteps = config.timesteps
+        
+    def alpha_schedule(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Compute alpha_t the probability of not masking at time t.
+        
+        Args:
+            t: Time in [0, 1]
+        """
+        if self.config.noise_schedule == "cosine":
+            # Cosine schedule: alpha_t = cos(pi*t/2)
+            alpha_t = torch.cos(torch.pi * t / 2)
+        elif self.config.noise_schedule == "linear":
+            # Linear schedule: alpha_t = 1 - t
+            alpha_t = 1 - t
+        else:
+            # Default to cosine
+            alpha_t = torch.cos(torch.pi * t / 2)
+        
+        return alpha_t
+    
+    def alpha_derivative(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Compute alpha'_t -> the derivative of alpha_t with respect to t.
+        
+        Args:
+            t: Time in [0, 1]
+        """
+        if self.config.noise_schedule == "cosine":
+            # Derivative of cos(pi*t/2) = -pi/2 * sin(pi*t/2)
+            alpha_prime = -torch.pi/2 * torch.sin(torch.pi * t / 2)
+        elif self.config.noise_schedule == "linear":
+            # Derivative of (1 - t) = -1
+            alpha_prime = torch.ones_like(t) * (-1)
+        else:
+            # Default to cosine
+            alpha_prime = -torch.pi/2 * torch.sin(torch.pi * t / 2)
+        
+        return alpha_prime
+    
+    def compute_mdlm_elbo_loss(
+        self,
+        model=None,
+        x_0: torch.Tensor = None,
+        product_mask: torch.Tensor = None,
+        # For testing - allow precomputed values
+        precomputed_logits: torch.Tensor = None,
+        precomputed_t: torch.Tensor = None,
+        precomputed_x_noisy: torch.Tensor = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute NELBO following equation (47) from the MDLM paper.
+        
+        The algorithm (Algorithm 1 in the paper):
+        1. Sample a sentence x ~ q(x)
+        2. Sample a time step t ~ U[0,1]
+        3. Mask tokens: z_t ~ Cat(z_t; alpha_t*x + (1-alpha_t)*m) for each token
+        4. Compute gradient on: alpha'_t/(1-alpha_t) * sum_ℓ log(x_θ_ℓ(z_t, t), x^ℓ)
+        
+        Args:
+            model: The diffusion model
+            x_0: Original sequence [batch_size, seq_len]
+            product_mask: Where to apply masking [batch_size, seq_len]
+            
+        Returns:
+            Dictionary with loss and metrics
+        """
+        device = x_0.device
+        batch_size = x_0.shape[0]
+        
+        # Step 2: Sample time uniformly from [0, 1]
+        # t = torch.rand(batch_size, device=device)
+        t = precomputed_t
+        
+        # Compute alpha_t and alpha'_t
+        alpha_t = self.alpha_schedule(t)
+        alpha_prime_t = self.alpha_derivative(t)
+        
+        # Step 3: Mask tokens according to alpha_t
+        # Each token has probability (1 - alpha_t) of being masked
+        # noise = torch.rand_like(x_0, dtype=torch.float32)
+        # should_mask = (noise > alpha_t.unsqueeze(-1)) & product_mask
+        # z_t = torch.where(should_mask, self.mask_token_id, x_0)
+        z_t = precomputed_x_noisy
+        
+        # Step 4: Model forward pass
+        # outputs = model(z_t, t)
+        # logits = outputs["logits"]
+        logits = precomputed_logits
+        
+        # Step 5: Compute the loss with the NELBO weight
+        # Weight: alpha'_t / (1 - alpha_t)
+        # alpha'_t is negative for decreasing schedules, so negate to make it positive
+        weight = -alpha_prime_t / (1 - alpha_t + 1e-8)
+        
+        # Only compute loss on masked positions
+        is_masked = (z_t == self.mask_token_id)
+        is_not_padding = (x_0 != self.pad_token_id)
+        valid_positions = product_mask & is_masked & is_not_padding
+        
+        if not valid_positions.any():
+            return {
+                "nelbo": torch.tensor(0.0, device=device, requires_grad=True),
+                "num_masked": 0,
+                "weight": weight.mean().item(),
+                "alpha_t": alpha_t.mean().item()
+            }
+        
+        # Cross-entropy loss on masked positions
+        # This is sum_ℓ log(x_θ_ℓ(z_t, t), x^ℓ) from the paper
+        ce_loss = F.cross_entropy(
+            logits[valid_positions],
+            x_0[valid_positions],
+            reduction='none'
+        )
+        
+        # Apply the NELBO weight
+        # We need to map the per-token losses back to per-example
+        batch_idx, seq_idx = torch.where(valid_positions)
+        
+        # Aggregate losses per example
+        per_example_loss = torch.zeros(batch_size, device=device)
+        per_example_loss.index_add_(0, batch_idx, ce_loss)
+        
+        # Count valid tokens per example
+        valid_counts = torch.zeros(batch_size, device=device)
+        ones = torch.ones_like(ce_loss)
+        valid_counts.index_add_(0, batch_idx, ones)
+        
+        # Average loss per example
+        per_example_loss = per_example_loss / (valid_counts + 1e-8)
+        
+        # Apply NELBO weight
+        weighted_loss = weight * per_example_loss
+        
+        # Final loss is mean over batch
+        nelbo = weighted_loss.mean()
+        
+        return {
+            "nelbo": nelbo,
+            "num_masked": valid_positions.sum().item(),
+            "weight": weight.mean().item(),
+            "alpha_t": alpha_t.mean().item(),
+            "alpha_prime_t": alpha_prime_t.mean().item(),
+            "t": t.mean().item()
+        }
+
+
+class NELBOLoss:
+    """
+    Negative Evidence Lower Bound (NELBO) Loss implementation.
+    Based on "Simplified and Generalized Masked Diffusion for Discrete Data".
+    """
+    
+    def __init__(self, config):
+        """
+        Args:
+            config: Config object with attributes:
+                - timesteps: int
+                - mask_token_id: int
+                - pad_token_id: int
+                - noise_schedule: str
+        """
+        self.config = config
+        
+        # Build alpha schedule (cumulative product)
+        self.alphas_cumprod = self._build_alpha_cumprod()
+        
+    def _build_alpha_cumprod(self) -> torch.Tensor:
+        """Build cumulative product of alphas."""
+        t = torch.linspace(0, 1, self.config.timesteps)
+        
+        if self.config.noise_schedule == "cosine":
+            alphas = torch.cos(torch.pi / 2 * t)
+        elif self.config.noise_schedule == "linear":
+            alphas = 1 - t
+        else:
+            alphas = torch.cos(torch.pi / 2 * t)  # Default to cosine
+        
+        # Cumulative product
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod[0] = 1.0
+        
+        return alphas_cumprod
+    
+    def compute_nelbo_loss(self, logits: torch.Tensor, x_target: torch.Tensor, 
+                           x_noisy: torch.Tensor, t: torch.Tensor, 
+                           product_mask: torch.Tensor, is_masked: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute the Negative Evidence Lower Bound (NELBO) loss.
+        
+        Args:
+            logits: Model predictions [batch, seq_len, vocab_size]
+            x_target: Original target sequence (x_0) [batch, seq_len]
+            x_noisy: Noisy input sequence (x_t) [batch, seq_len]
+            t: Timestep in [0, 1] [batch]
+            product_mask: Mask for product positions [batch, seq_len]
+            is_masked: Boolean indicating which positions are masked [batch, seq_len]
+        
+        Returns:
+            Dictionary with 'nelbo' loss and additional metrics
+        """
+        batch_size, seq_len, vocab_size = logits.shape
+        device = logits.device
+        
+        # Move alphas to device
+        self.alphas_cumprod = self.alphas_cumprod.to(device)
+
+        print(f"DEBUG: t values: {t}")
+        print(f"DEBUG: t_indices: {t_indices}")
+        
+        # Maps continuous t in [0,1] to discrete timesteps 0..T-1
+        t_indices = (t * (self.config.timesteps - 1)).long()
+        t_indices = torch.clamp(t_indices, 0, self.config.timesteps - 1)
+        
+        # Get alpha values for current timestep
+        alpha_t = self.alphas_cumprod.gather(0, t_indices)  # [batch]
+        
+        # 1. Reconstruction term
+        is_first_step = (t <= 1.0 / self.config.timesteps)
+        print(f"DEBUG: is_first_step: {is_first_step.any()}")
+        
+        reconstruction_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        if is_first_step.any():
+            first_step_positions = is_first_step.unsqueeze(-1) & product_mask & (x_target != self.config.pad_token_id)
+            if first_step_positions.any():
+                log_probs = F.log_softmax(logits, dim=-1)
+                true_log_probs = torch.gather(log_probs, -1, x_target.unsqueeze(-1)).squeeze(-1)
+                print("true log probs dtype:", true_log_probs[first_step_positions].dtype)
+                reconstruction_loss = -true_log_probs[first_step_positions].mean()
+        
+        # 2. Prior KL term
+        is_final_step = (t >= (self.config.timesteps - 1) / self.config.timesteps)
+        print(f"DEBUG: is_final_step: {is_final_step.any()}")
+        
+        prior_kl_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        if is_final_step.any():
+            final_positions = is_final_step.unsqueeze(-1) & product_mask
+            if final_positions.any():
+                uniform_prob = 1.0 / vocab_size
+                log_probs = F.log_softmax(logits[final_positions], dim=-1)
+                prior_kl_loss = F.kl_div(log_probs, torch.ones_like(log_probs) * uniform_prob, reduction='batchmean')
+        
+        # 3. Intermediate KL terms
+        intermediate_kl_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        print(f"DEBUG: intermediate steps: {not (is_first_step.all() or is_final_step.all())}")
+        if not (is_first_step.all() or is_final_step.all()):
+            valid_positions = product_mask & (x_target != self.config.pad_token_id) & is_masked
+            
+            if valid_positions.any():
+                # Get transition probabilities
+                alpha_t_prev = torch.where(
+                    t_indices > 0,
+                    self.alphas_cumprod.gather(0, (t_indices - 1).clamp(min=0)),
+                    torch.ones_like(alpha_t)
+                )
+                
+                # Compute the probability of staying masked
+                stay_masked_prob = 1 - (alpha_t_prev - alpha_t) / (1 - alpha_t + 1e-8)
+                stay_masked_prob = torch.clamp(stay_masked_prob, 0.0, 1.0)  # [batch]
+                
+                # Model's predicted probabilities
+                probs = F.softmax(logits, dim=-1)
+                
+                # For masked positions, compute KL
+                masked_positions = valid_positions & is_masked
+                if masked_positions.any():
+                    # Get probability of predicting the true token
+                    true_token_probs = torch.gather(probs, -1, x_target.unsqueeze(-1)).squeeze(-1)
+                    
+                    # Compute KL divergence
+                    unmask_prob = (1 - stay_masked_prob)  # [batch]
+                    unmask_prob_expanded = unmask_prob.unsqueeze(-1).expand(-1, seq_len)  # [batch, seq_len]
+                    unmask_prob_selected = unmask_prob_expanded[masked_positions]
+                    true_token_probs_selected = true_token_probs[masked_positions]
+                    
+                    # Simplified KL for the unmasking decision
+                    kl_per_position = unmask_prob_selected * torch.log(
+                        (unmask_prob_selected + 1e-8) / (true_token_probs_selected + 1e-8)
+                    )
+                    print("intermediate kl loss dtype:", kl_per_position.dtype)
+                    intermediate_kl_loss = kl_per_position.mean()
+        
+        # 4. Combine all terms
+        nelbo = reconstruction_loss + prior_kl_loss + intermediate_kl_loss
+        
+        # For stability, also add standard cross-entropy on masked positions
+        ce_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        valid_ce_positions = product_mask & (x_target != self.config.pad_token_id) & is_masked
+        if valid_ce_positions.any():
+            ce_loss = F.cross_entropy(
+                logits[valid_ce_positions], 
+                x_target[valid_ce_positions],
+                reduction='mean'
+            )
+        
+        # Combine with cross-entropy for training stability
+        nelbo_weight = min(1.0, t_indices.float().mean().item() / self.config.timesteps)
+        combined_loss = nelbo_weight * nelbo + (1 - nelbo_weight) * ce_loss
+        
+        return {
+            "nelbo": combined_loss,
+            "reconstruction_loss": reconstruction_loss.item(),
+            "prior_kl_loss": prior_kl_loss.item(),
+            "intermediate_kl_loss": intermediate_kl_loss.item(),
+            "ce_loss": ce_loss.item(),
+            "nelbo_weight": nelbo_weight
+        }
