@@ -568,3 +568,349 @@ class NELBOLoss:
             "ce_loss": ce_loss.item(),
             "nelbo_weight": nelbo_weight
         }
+
+import torch
+import torch.nn.functional as F
+from typing import Dict, Tuple, Optional, List
+
+class ReMDMELBOLoss:
+    """
+    ELBO Loss implementation for ReMasking Discrete Diffusion Models (ReMDM).
+    Implements the confidence-based remasking schedule from the ReMDM paper.
+    
+    ELBO: sum_{t=1}^T E_q_sigma[((1-sigma_t)*alpha_t - alpha_s)/(1-alpha_t) * log <x_theta(z_t), x>]
+    """
+    
+    def __init__(self, config):
+        """
+        Args:
+            config: Config object with attributes:
+                - timesteps: int
+                - mask_token_id: int
+                - pad_token_id: int
+                - noise_schedule: str ("linear", "cosine", "geometric")
+                - base_sigma: float (base remasking probability, default 0.5)
+                - temperature: float (for confidence score softmax, default 1.0)
+        """
+        self.config = config
+        self.mask_token_id = config.mask_token_id
+        self.pad_token_id = config.pad_token_id
+        self.timesteps = config.timesteps
+        self.base_sigma = getattr(config, 'base_sigma', 0.5)
+        self.temperature = getattr(config, 'temperature', 1.0)
+        
+        # Pre-compute alpha schedule
+        self.alphas = self._build_alpha_schedule()
+        
+        # Store confidence scores for each position
+        self.confidence_scores = {}  # Will store per-sequence confidence
+        
+    def _build_alpha_schedule(self) -> torch.Tensor:
+        """
+        Build alpha schedule based on config.
+        Returns tensor of shape (timesteps + 1,) where alpha[0] = 1.0
+        """
+        t = torch.linspace(0, 1, self.timesteps + 1)
+        
+        if self.config.noise_schedule == "linear":
+            alphas = 1 - t
+        elif self.config.noise_schedule == "cosine":
+            alphas = torch.cos(torch.pi / 2 * t)
+        elif self.config.noise_schedule == "geometric":
+            beta_min, beta_max = 1e-5, 20
+            alphas = torch.exp(-beta_min * (1-t) * beta_max**t)
+        else:
+            # Default to cosine
+            alphas = torch.cos(torch.pi / 2 * t)
+        
+        # Ensure alpha[0] = 1.0 (no noise at t=0)
+        alphas[0] = 1.0
+        
+        return alphas
+    
+    def compute_confidence_based_sigma(
+        self,
+        x_noisy: torch.Tensor,
+        model_logits: torch.Tensor,
+        product_mask: torch.Tensor,
+        batch_idx: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute confidence-based sigma schedule for each token.
+        
+        σ^(ℓ)_t = η^(ℓ)_conf · σ_t
+        where η^(ℓ)_conf = exp(-ψ^(ℓ)_t) / Σ_ℓ' exp(-ψ^(ℓ')_t)
+        
+        Args:
+            x_noisy: Current noisy sequence [batch, seq_len]
+            model_logits: Model predictions [batch, seq_len, vocab_size]
+            product_mask: Boolean mask for product positions [batch, seq_len]
+            batch_idx: Optional batch indices for tracking confidence
+            
+        Returns:
+            sigma: Per-token remasking probabilities [batch, seq_len]
+        """
+        batch_size, seq_len = x_noisy.shape
+        device = x_noisy.device
+        
+        # Initialize confidence scores
+        psi = torch.full((batch_size, seq_len), float('inf'), device=device)
+        
+        # Get probabilities from logits
+        probs = F.softmax(model_logits, dim=-1)
+        
+        # For unmasked tokens, compute confidence scores
+        is_unmasked = (x_noisy != self.mask_token_id) & product_mask
+        
+        if is_unmasked.any():
+            # Get the predicted probability for the actual token
+            batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+            seq_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+            
+            # Extract probabilities for actual tokens where unmasked
+            token_probs = probs[batch_indices, seq_indices, x_noisy]
+            
+            # Set confidence scores (psi) for unmasked tokens
+            psi[is_unmasked] = token_probs[is_unmasked]
+            
+            # Store confidence scores for tracking (optional)
+            if batch_idx is not None:
+                for b in range(batch_size):
+                    key = batch_idx[b].item() if batch_idx is not None else b
+                    if key not in self.confidence_scores:
+                        self.confidence_scores[key] = {}
+                    
+                    for s in range(seq_len):
+                        if is_unmasked[b, s]:
+                            self.confidence_scores[key][(b, s)] = token_probs[b, s].item()
+        
+        # Compute eta_conf using negative psi (lower confidence -> higher remasking prob)
+        # For masked tokens (psi = inf), exp(-psi) = 0, so they won't be remasked
+        exp_neg_psi = torch.exp(-psi / self.temperature)
+        
+        # Normalize across sequence for each batch
+        eta_conf = exp_neg_psi / (exp_neg_psi.sum(dim=1, keepdim=True) + 1e-10)
+        
+        # Scale by base sigma
+        sigma = eta_conf * self.base_sigma * seq_len  # Scale by seq_len to maintain expected number of remaskings
+        
+        # Ensure masked tokens have sigma = 0 (they shouldn't be remasked)
+        sigma[~is_unmasked] = 0.0
+        
+        return sigma
+    
+    def compute_elbo_weights(
+        self,
+        t_indices: torch.Tensor,
+        sigma: torch.Tensor,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Compute ELBO weights for ReMDM.
+        
+        w(t) = ((1 - sigma_t) * alpha_t - alpha_{t-1}) / (1 - alpha_t)
+        
+        Args:
+            t_indices: Timestep indices [batch] (ranging from 1 to timesteps)
+            sigma: Per-token remasking probabilities [batch, seq_len]
+            device: Device to use
+            
+        Returns:
+            weights: Per-token weights [batch, seq_len]
+        """
+        alphas = self.alphas.to(device)
+        
+        # Ensure t_indices are valid (should be between 1 and timesteps)
+        t_indices = t_indices.clamp(min=1, max=self.timesteps)
+        
+        # Get alpha values
+        # alpha_t corresponds to current timestep
+        alpha_t = alphas[t_indices].unsqueeze(1)  # [batch, 1]
+        # alpha_s corresponds to previous timestep (less noisy)
+        # When t=1, we want alpha_0 which should be 1.0 (no noise)
+        alpha_s = alphas[t_indices - 1].unsqueeze(1)  # [batch, 1]
+        
+        # Compute denominator with stability
+        denominator = 1.0 - alpha_t + 1e-8
+        
+        # Compute weights: ((1 - sigma) * alpha_t - alpha_s) / (1 - alpha_t)
+        weights = ((1.0 - sigma) * alpha_t - alpha_s) / denominator
+        
+        # Clamp for stability
+        weights = torch.clamp(weights, min=0.0, max=100.0)
+        
+        return weights
+    
+    def remask_sequence(
+        self,
+        x_current: torch.Tensor,
+        sigma: torch.Tensor,
+        product_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Apply remasking based on sigma probabilities.
+        
+        Args:
+            x_current: Current sequence [batch, seq_len]
+            sigma: Remasking probabilities [batch, seq_len]
+            product_mask: Valid positions mask [batch, seq_len]
+            
+        Returns:
+            x_remasked: Sequence after remasking [batch, seq_len]
+        """
+        # Sample remasking decisions
+        remask_prob = torch.rand_like(sigma)
+        should_remask = (remask_prob < sigma) & product_mask
+        
+        # Apply remasking
+        x_remasked = torch.where(should_remask, self.mask_token_id, x_current)
+        
+        return x_remasked
+    
+    def compute_elbo_loss(
+        self,
+        model=None,
+        x_target: torch.Tensor = None,
+        product_mask: torch.Tensor = None,
+        num_samples: int = 1,
+        # For testing - allow precomputed values
+        precomputed_logits: torch.Tensor = None,
+        precomputed_t: torch.Tensor = None,
+        precomputed_x_noisy: torch.Tensor = None,
+        precomputed_sigma: torch.Tensor = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute ELBO loss for ReMDM with confidence-based remasking.
+        
+        Args:
+            model: The diffusion model (optional if precomputed_logits provided)
+            x_target: Original sequence [batch, seq_len]
+            product_mask: Boolean mask for product positions [batch, seq_len]
+            num_samples: Number of samples for Monte Carlo estimation
+            precomputed_logits: For testing - pre-computed model outputs
+            precomputed_t: For testing - pre-computed timesteps
+            precomputed_x_noisy: For testing - pre-computed noisy sequences
+            precomputed_sigma: For testing - pre-computed sigma values
+            
+        Returns:
+            Dictionary containing loss and diagnostic information
+        """
+        batch_size, seq_len = x_target.shape
+        device = x_target.device
+        
+        # Move alphas to device
+        alphas = self.alphas.to(device)
+        
+        # Use precomputed or sample timesteps
+        if precomputed_t is not None:
+            t = precomputed_t
+            if t.max() <= 1.0:
+                t_indices = (t * self.timesteps).long().clamp(1, self.timesteps)
+            else:
+                t_indices = t.long()
+        else:
+            # Sample timesteps uniformly
+            t_indices = torch.randint(1, self.timesteps + 1, (batch_size,), device=device)
+            t = t_indices.float() / self.timesteps
+        
+        # Initialize loss accumulator for Monte Carlo estimation
+        total_loss = 0.0
+        total_diagnostics = {
+            "num_masked_tokens": 0,
+            "num_remasked_tokens": 0,
+            "mean_sigma": 0.0,
+            "mean_weight": 0.0
+        }
+        
+        for sample_idx in range(num_samples):
+            # Use precomputed or generate noisy sequence
+            if precomputed_x_noisy is not None:
+                x_noisy = precomputed_x_noisy
+            else:
+                # Forward diffusion process
+                alpha_t = alphas[t_indices]
+                
+                # Initial masking based on alpha_t
+                mask_prob = torch.rand_like(x_target, dtype=torch.float32)
+                should_mask = (mask_prob > alpha_t.unsqueeze(-1)) & product_mask
+                x_noisy = torch.where(should_mask, self.mask_token_id, x_target)
+            
+            # Use precomputed or get model predictions
+            if precomputed_logits is not None:
+                logits = precomputed_logits
+            else:
+                if model is None:
+                    raise ValueError("Either model or precomputed_logits must be provided")
+                outputs = model(x_noisy, t)
+                logits = outputs["logits"]
+            
+            # Compute confidence-based sigma
+            if precomputed_sigma is not None:
+                sigma = precomputed_sigma
+            else:
+                sigma = self.compute_confidence_based_sigma(
+                    x_noisy, logits, product_mask
+                )
+            
+            # Apply remasking based on sigma
+            x_remasked = self.remask_sequence(x_noisy, sigma, product_mask)
+            
+            # Compute ELBO weights
+            weights = self.compute_elbo_weights(t_indices, sigma, device)
+            
+            # Identify positions to compute loss on
+            # Loss should ONLY be computed on positions that are masked in x_remasked
+            # This includes both originally masked positions that stay masked AND newly remasked positions
+            is_currently_masked = (x_remasked == self.mask_token_id)
+            is_not_padding = (x_target != self.pad_token_id)
+            
+            # Valid positions for loss computation - only currently masked positions
+            valid_positions = (is_currently_masked & product_mask & is_not_padding)
+            
+            # For diagnostics, track what was originally masked vs remasked
+            is_originally_masked = (x_noisy == self.mask_token_id)
+            is_remasked = (x_noisy != self.mask_token_id) & (x_remasked == self.mask_token_id)
+            
+            if not valid_positions.any():
+                continue
+            
+            # Compute cross-entropy loss
+            logits_flat = logits.reshape(-1, logits.size(-1))
+            targets_flat = x_target.reshape(-1)
+            valid_flat = valid_positions.reshape(-1)
+            weights_flat = weights.reshape(-1)
+            
+            # Get valid logits, targets, and weights
+            valid_logits = logits_flat[valid_flat]
+            valid_targets = targets_flat[valid_flat]
+            valid_weights = weights_flat[valid_flat]
+            
+            # Compute weighted token-level loss
+            token_losses = F.cross_entropy(valid_logits, valid_targets, reduction='none')
+            weighted_token_losses = valid_weights * token_losses
+            
+            # Aggregate loss
+            sample_loss = weighted_token_losses.mean()
+            total_loss = total_loss + sample_loss
+            
+            # Update diagnostics
+            total_diagnostics["num_masked_tokens"] += is_originally_masked.sum().item()
+            total_diagnostics["num_remasked_tokens"] += is_remasked.sum().item()
+            total_diagnostics["mean_sigma"] += sigma[product_mask].mean().item()
+            total_diagnostics["mean_weight"] += weights[product_mask].mean().item()
+        
+        # Average over samples
+        final_loss = total_loss / max(num_samples, 1)
+        
+        # Average diagnostics
+        for key in total_diagnostics:
+            total_diagnostics[key] /= max(num_samples, 1)
+        
+        return {
+            "loss": final_loss,
+            "num_masked_tokens": total_diagnostics["num_masked_tokens"],
+            "num_remasked_tokens": total_diagnostics["num_remasked_tokens"],
+            "mean_sigma": total_diagnostics["mean_sigma"],
+            "mean_weight": total_diagnostics["mean_weight"],
+            "t_mean": t.float().mean().item()
+        }
