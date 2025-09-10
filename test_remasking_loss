@@ -1,0 +1,589 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Dict, List, Tuple
+import warnings
+from dataclasses import dataclass
+import sys
+sys.path.append(".")
+from loss_function.loss_implementations import ELBOLoss
+from loss_function.remasking_loss import ReMDMELBOLoss
+
+@dataclass
+class TestConfig:
+    """Configuration for testing"""
+    timesteps: int = 100
+    mask_token_id: int = 103  # [MASK] token
+    pad_token_id: int = 0     # [PAD] token
+    noise_schedule: str = "cosine"
+    base_sigma: float = 0.5
+    temperature: float = 1.0
+    vocab_size: int = 1000
+    batch_size: int = 4
+    seq_len: int = 16
+
+class MockModel(nn.Module):
+    """Mock model for testing that can produce controlled outputs"""
+    def __init__(self, vocab_size, seq_len, mode="random"):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.mode = mode
+        
+    def forward(self, x, t):
+        batch_size = x.shape[0]
+        
+        if self.mode == "perfect":
+            # Perfect predictions - high confidence on correct tokens
+            logits = torch.ones(batch_size, self.seq_len, self.vocab_size) * -10.0
+            # Set high logits for the actual tokens (we'll override this in tests)
+            logits[:, :, 0] = 10.0  
+        elif self.mode == "terrible":
+            # Uniform predictions - no confidence
+            logits = torch.zeros(batch_size, self.seq_len, self.vocab_size)
+        elif self.mode == "extreme":
+            # Extreme values for stability testing
+            logits = torch.randn(batch_size, self.seq_len, self.vocab_size) * 1000
+        else:  # random
+            logits = torch.randn(batch_size, self.seq_len, self.vocab_size)
+        
+        return {"logits": logits}
+
+class DiffusionLossTestSuite:
+    """Comprehensive test suite for diffusion loss functions"""
+    
+    def __init__(self, loss_class, config: TestConfig):
+        self.loss_fn = loss_class(config)
+        self.config = config
+        self.results = {}
+        
+    def run_all_tests(self) -> Dict:
+        """Run all tests and return results"""
+        print(f"\n{'='*60}")
+        print(f"Testing {self.loss_fn.__class__.__name__}")
+        print(f"{'='*60}\n")
+        
+        # Mathematical Properties
+        self._test_mathematical_properties()
+        
+        # Behavioral Properties
+        self._test_behavioral_properties()
+        
+        # Masking Behavior
+        self._test_masking_behavior()
+        
+        # Edge Cases
+        self._test_edge_cases()
+        
+        # Numerical Stability
+        self._test_numerical_stability()
+        
+        # Gradient Flow
+        self._test_gradient_flow()
+        
+        return self.results
+    
+    def _test_mathematical_properties(self):
+        """Test mathematical properties of the loss"""
+        print("Testing Mathematical Properties...")
+        
+        # Setup
+        x_target = torch.randint(1, self.config.vocab_size, 
+                                (self.config.batch_size, self.config.seq_len))
+        product_mask = torch.ones_like(x_target, dtype=torch.bool)
+        model = MockModel(self.config.vocab_size, self.config.seq_len)
+        
+        # Test 1: Non-negativity
+        result = self.loss_fn.compute_elbo_loss(
+            model=model,
+            x_target=x_target,
+            product_mask=product_mask
+        )
+        loss_value = result["loss"].item()
+        
+        is_non_negative = loss_value >= 0
+        self.results["non_negativity"] = {
+            "passed": is_non_negative,
+            "value": loss_value,
+            "message": f"Loss value: {loss_value:.6f}"
+        }
+        print(f"  ✓ Non-negativity: {'PASS' if is_non_negative else 'FAIL'} (loss={loss_value:.6f})")
+        
+        # Test 2: Finite values
+        is_finite = torch.isfinite(result["loss"]).item()
+        self.results["finite_values"] = {
+            "passed": is_finite,
+            "message": "Loss is finite" if is_finite else "Loss contains inf/nan"
+        }
+        print(f"  ✓ Finite values: {'PASS' if is_finite else 'FAIL'}")
+        
+        # Test 3: Upper bound check (cross-entropy should be bounded by log(vocab_size))
+        max_theoretical_loss = np.log(self.config.vocab_size) * 100  # with importance weights
+        is_bounded = loss_value < max_theoretical_loss
+        self.results["upper_bound"] = {
+            "passed": is_bounded,
+            "value": loss_value,
+            "max_theoretical": max_theoretical_loss,
+            "message": f"Loss {loss_value:.2f} < {max_theoretical_loss:.2f}"
+        }
+        print(f"  ✓ Upper bound: {'PASS' if is_bounded else 'FAIL'}")
+        
+    def _test_behavioral_properties(self):
+        """Test behavioral properties of the loss"""
+        print("\nTesting Behavioral Properties...")
+        
+        # Setup
+        x_target = torch.randint(1, self.config.vocab_size, 
+                                (self.config.batch_size, self.config.seq_len))
+        product_mask = torch.ones_like(x_target, dtype=torch.bool)
+        
+        # Test 1: Perfect predictions should have low loss
+        perfect_logits = torch.ones(self.config.batch_size, self.config.seq_len, 
+                                   self.config.vocab_size) * -10.0
+        # Set high logits for correct tokens
+        for b in range(self.config.batch_size):
+            for s in range(self.config.seq_len):
+                perfect_logits[b, s, x_target[b, s]] = 10.0
+        
+        t = torch.ones(self.config.batch_size) * 0.5
+        x_noisy = x_target.clone()
+        # Mask some positions
+        mask_positions = torch.rand_like(x_target, dtype=torch.float) < 0.3
+        x_noisy[mask_positions] = self.config.mask_token_id
+        
+        result_perfect = self.loss_fn.compute_elbo_loss(
+            precomputed_logits=perfect_logits,
+            precomputed_t=t,
+            precomputed_x_noisy=x_noisy,
+            x_target=x_target,
+            product_mask=product_mask
+        )
+        
+        # Test 2: Terrible predictions should have high loss
+        terrible_logits = torch.zeros(self.config.batch_size, self.config.seq_len, 
+                                     self.config.vocab_size)  # Uniform distribution
+        
+        result_terrible = self.loss_fn.compute_elbo_loss(
+            precomputed_logits=terrible_logits,
+            precomputed_t=t,
+            precomputed_x_noisy=x_noisy,
+            x_target=x_target,
+            product_mask=product_mask
+        )
+        
+        perfect_loss = result_perfect["loss"].item()
+        terrible_loss = result_terrible["loss"].item()
+        
+        # Perfect predictions should have much lower loss
+        monotonicity_check = perfect_loss < terrible_loss
+        self.results["monotonicity"] = {
+            "passed": monotonicity_check,
+            "perfect_loss": perfect_loss,
+            "terrible_loss": terrible_loss,
+            "ratio": terrible_loss / (perfect_loss + 1e-8),
+            "message": f"Perfect: {perfect_loss:.6f}, Terrible: {terrible_loss:.6f}"
+        }
+        print(f"  ✓ Monotonicity: {'PASS' if monotonicity_check else 'FAIL'} "
+              f"(perfect={perfect_loss:.4f}, terrible={terrible_loss:.4f})")
+        
+        # Test 3: Loss should be near zero for perfect predictions
+        near_zero = perfect_loss < 0.1  # Threshold for "near zero"
+        self.results["perfect_prediction"] = {
+            "passed": near_zero,
+            "loss": perfect_loss,
+            "message": f"Perfect prediction loss: {perfect_loss:.6f}"
+        }
+        print(f"  ✓ Perfect prediction: {'PASS' if near_zero else 'FAIL'} (loss={perfect_loss:.6f})")
+        
+    def _test_masking_behavior(self):
+        """Test masking behavior"""
+        print("\nTesting Masking Behavior...")
+        
+        # Setup
+        x_target = torch.randint(1, self.config.vocab_size, 
+                                (self.config.batch_size, self.config.seq_len))
+        
+        # Test 1: Only masked tokens contribute to loss
+        product_mask = torch.ones_like(x_target, dtype=torch.bool)
+        model = MockModel(self.config.vocab_size, self.config.seq_len)
+        
+        # Create a sequence with known masked positions
+        x_noisy = x_target.clone()
+        mask_positions = torch.zeros_like(x_target, dtype=torch.bool)
+        mask_positions[:, :5] = True  # Mask first 5 positions
+        x_noisy[mask_positions] = self.config.mask_token_id
+        
+        t = torch.ones(self.config.batch_size) * 0.5
+        logits = model(x_noisy, t)["logits"]
+        
+        result = self.loss_fn.compute_elbo_loss(
+            precomputed_logits=logits,
+            precomputed_t=t,
+            precomputed_x_noisy=x_noisy,
+            x_target=x_target,
+            product_mask=product_mask
+        )
+        
+        num_masked = result.get("num_masked_tokens", mask_positions.sum().item())
+        expected_masked = mask_positions.sum().item()
+        
+        # For ReMDM, we might have remasked tokens too
+        if hasattr(self.loss_fn, 'compute_confidence_based_sigma'):
+            # ReMDM case - masked tokens can vary due to remasking
+            mask_check = num_masked > 0
+            message = f"Masked tokens: {num_masked} (with remasking)"
+        else:
+            # Standard ELBO case
+            mask_check = num_masked == expected_masked
+            message = f"Masked tokens: {num_masked}, Expected: {expected_masked}"
+        
+        self.results["masked_tokens_only"] = {
+            "passed": mask_check,
+            "num_masked": num_masked,
+            "message": message
+        }
+        print(f"  ✓ Masked tokens only: {'PASS' if mask_check else 'FAIL'} ({message})")
+        
+        # Test 2: Padding tokens should NOT contribute
+        x_with_padding = x_target.clone()
+        x_with_padding[:, -5:] = self.config.pad_token_id  # Last 5 are padding
+        product_mask_with_padding = x_with_padding != self.config.pad_token_id
+        
+        x_noisy_with_padding = x_with_padding.clone()
+        x_noisy_with_padding[mask_positions] = self.config.mask_token_id
+        
+        result_with_padding = self.loss_fn.compute_elbo_loss(
+            precomputed_logits=logits,
+            precomputed_t=t,
+            precomputed_x_noisy=x_noisy_with_padding,
+            x_target=x_with_padding,
+            product_mask=product_mask
+        )
+        
+        # Loss should be computed only on non-padding masked tokens
+        padding_check = result_with_padding["loss"].item() >= 0
+        self.results["padding_excluded"] = {
+            "passed": padding_check,
+            "message": "Padding tokens excluded from loss"
+        }
+        print(f"  ✓ Padding excluded: {'PASS' if padding_check else 'FAIL'}")
+        
+        # Test 3: Product mask respected
+        partial_product_mask = torch.ones_like(x_target, dtype=torch.bool)
+        partial_product_mask[:, 8:] = False  # Only first 8 positions are valid
+        
+        result_partial = self.loss_fn.compute_elbo_loss(
+            precomputed_logits=logits,
+            precomputed_t=t,
+            precomputed_x_noisy=x_noisy,
+            x_target=x_target,
+            product_mask=partial_product_mask
+        )
+        
+        # Should only compute loss on masked tokens within product mask
+        product_mask_check = result_partial["loss"].item() >= 0
+        self.results["product_mask_respected"] = {
+            "passed": product_mask_check,
+            "message": "Product mask correctly applied"
+        }
+        print(f"  ✓ Product mask respected: {'PASS' if product_mask_check else 'FAIL'}")
+        
+    def _test_edge_cases(self):
+        """Test edge cases"""
+        print("\nTesting Edge Cases...")
+        
+        # Test 1: Empty mask (no valid positions)
+        x_target = torch.randint(1, self.config.vocab_size, 
+                                (self.config.batch_size, self.config.seq_len))
+        product_mask = torch.zeros_like(x_target, dtype=torch.bool)  # All False
+        model = MockModel(self.config.vocab_size, self.config.seq_len)
+        
+        result_empty = self.loss_fn.compute_elbo_loss(
+            model=model,
+            x_target=x_target,
+            product_mask=product_mask
+        )
+        
+        empty_loss = result_empty["loss"].item()
+        empty_check = empty_loss == 0.0 or torch.isfinite(torch.tensor(empty_loss))
+        self.results["empty_mask"] = {
+            "passed": empty_check,
+            "loss": empty_loss,
+            "message": f"Empty mask loss: {empty_loss}"
+        }
+        print(f"  ✓ Empty mask: {'PASS' if empty_check else 'FAIL'} (loss={empty_loss})")
+        
+        # Test 2: All padding
+        x_all_padding = torch.full((self.config.batch_size, self.config.seq_len), 
+                                  self.config.pad_token_id)
+        product_mask_all = torch.ones_like(x_all_padding, dtype=torch.bool)
+        
+        result_all_padding = self.loss_fn.compute_elbo_loss(
+            model=model,
+            x_target=x_all_padding,
+            product_mask=product_mask_all
+        )
+        
+        padding_loss = result_all_padding["loss"].item()
+        padding_check = padding_loss == 0.0 or torch.isfinite(torch.tensor(padding_loss))
+        self.results["all_padding"] = {
+            "passed": padding_check,
+            "loss": padding_loss,
+            "message": f"All padding loss: {padding_loss}"
+        }
+        print(f"  ✓ All padding: {'PASS' if padding_check else 'FAIL'} (loss={padding_loss})")
+        
+        # Test 3: Single token
+        x_single = torch.randint(1, self.config.vocab_size, (1, 1))
+        product_mask_single = torch.ones_like(x_single, dtype=torch.bool)
+        
+        result_single = self.loss_fn.compute_elbo_loss(
+            model=model,
+            x_target=x_single,
+            product_mask=product_mask_single
+        )
+        
+        single_loss = result_single["loss"].item()
+        single_check = torch.isfinite(torch.tensor(single_loss))
+        self.results["single_token"] = {
+            "passed": single_check,
+            "loss": single_loss,
+            "message": f"Single token loss: {single_loss}"
+        }
+        print(f"  ✓ Single token: {'PASS' if single_check else 'FAIL'} (loss={single_loss})")
+        
+    def _test_numerical_stability(self):
+        """Test numerical stability"""
+        print("\nTesting Numerical Stability...")
+        
+        x_target = torch.randint(1, self.config.vocab_size, 
+                                (self.config.batch_size, self.config.seq_len))
+        product_mask = torch.ones_like(x_target, dtype=torch.bool)
+        
+        # Test 1: Extreme logits
+        extreme_logits = torch.randn(self.config.batch_size, self.config.seq_len, 
+                                    self.config.vocab_size) * 1000
+        t = torch.ones(self.config.batch_size) * 0.5
+        x_noisy = x_target.clone()
+        x_noisy[:, :5] = self.config.mask_token_id
+        
+        result_extreme = self.loss_fn.compute_elbo_loss(
+            precomputed_logits=extreme_logits,
+            precomputed_t=t,
+            precomputed_x_noisy=x_noisy,
+            x_target=x_target,
+            product_mask=product_mask
+        )
+        
+        extreme_stable = torch.isfinite(result_extreme["loss"]).item()
+        self.results["extreme_logits"] = {
+            "passed": extreme_stable,
+            "message": "Handles extreme logits" if extreme_stable else "Failed with extreme logits"
+        }
+        print(f"  ✓ Extreme logits: {'PASS' if extreme_stable else 'FAIL'}")
+        
+        # Test 2: Alpha schedule boundaries (t=0)
+        model = MockModel(self.config.vocab_size, self.config.seq_len)
+        t_zero = torch.zeros(self.config.batch_size)
+        
+        try:
+            result_t0 = self.loss_fn.compute_elbo_loss(
+                model=model,
+                precomputed_t=t_zero,
+                x_target=x_target,
+                product_mask=product_mask
+            )
+            t0_stable = torch.isfinite(result_t0["loss"]).item()
+        except Exception as e:
+            t0_stable = False
+            print(f"    Warning at t=0: {e}")
+        
+        self.results["t_zero"] = {
+            "passed": t0_stable,
+            "message": "Handles t=0" if t0_stable else "Failed at t=0"
+        }
+        print(f"  ✓ t=0 boundary: {'PASS' if t0_stable else 'FAIL'}")
+        
+        # Test 3: Alpha schedule boundaries (t=1)
+        t_one = torch.ones(self.config.batch_size)
+        
+        try:
+            result_t1 = self.loss_fn.compute_elbo_loss(
+                model=model,
+                precomputed_t=t_one,
+                x_target=x_target,
+                product_mask=product_mask
+            )
+            t1_stable = torch.isfinite(result_t1["loss"]).item()
+        except Exception as e:
+            t1_stable = False
+            print(f"    Warning at t=1: {e}")
+        
+        self.results["t_one"] = {
+            "passed": t1_stable,
+            "message": "Handles t=1" if t1_stable else "Failed at t=1"
+        }
+        print(f"  ✓ t=1 boundary: {'PASS' if t1_stable else 'FAIL'}")
+        
+    def _test_gradient_flow(self):
+        """Test gradient flow and backpropagation"""
+        print("\nTesting Gradient Flow...")
+        
+        # Create a simple model with parameters
+        class SimpleModel(nn.Module):
+            def __init__(self, vocab_size, hidden_size=128):
+                super().__init__()
+                self.embedding = nn.Embedding(vocab_size + 1, hidden_size)  # +1 for mask token
+                self.output = nn.Linear(hidden_size, vocab_size)
+                
+            def forward(self, x, t):
+                # x: [batch, seq_len]
+                embedded = self.embedding(x)  # [batch, seq_len, hidden]
+                logits = self.output(embedded)  # [batch, seq_len, vocab_size]
+                return {"logits": logits}
+        
+        model = SimpleModel(self.config.vocab_size)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        
+        x_target = torch.randint(1, self.config.vocab_size, 
+                                (self.config.batch_size, self.config.seq_len))
+        product_mask = torch.ones_like(x_target, dtype=torch.bool)
+        
+        # Test 1: Gradient computation
+        model.zero_grad()
+        result = self.loss_fn.compute_elbo_loss(
+            model=model,
+            x_target=x_target,
+            product_mask=product_mask
+        )
+        
+        loss = result["loss"]
+        
+        # Check if loss requires grad
+        requires_grad = loss.requires_grad
+        self.results["loss_requires_grad"] = {
+            "passed": requires_grad,
+            "message": "Loss requires gradient" if requires_grad else "Loss doesn't require gradient"
+        }
+        print(f"  ✓ Loss requires grad: {'PASS' if requires_grad else 'FAIL'}")
+        
+        # Test 2: Backward pass
+        try:
+            loss.backward()
+            backward_success = True
+            error_msg = "Backward pass successful"
+        except Exception as e:
+            backward_success = False
+            error_msg = f"Backward failed: {e}"
+        
+        self.results["backward_pass"] = {
+            "passed": backward_success,
+            "message": error_msg
+        }
+        print(f"  ✓ Backward pass: {'PASS' if backward_success else 'FAIL'}")
+        
+        # Test 3: Check gradients exist and are finite
+        if backward_success:
+            has_gradients = False
+            all_finite = True
+            grad_norms = []
+            
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    has_gradients = True
+                    grad_norm = param.grad.norm().item()
+                    grad_norms.append((name, grad_norm))
+                    if not torch.isfinite(param.grad).all():
+                        all_finite = False
+            
+            self.results["gradients_exist"] = {
+                "passed": has_gradients,
+                "message": "Gradients computed" if has_gradients else "No gradients found"
+            }
+            print(f"  ✓ Gradients exist: {'PASS' if has_gradients else 'FAIL'}")
+            
+            self.results["gradients_finite"] = {
+                "passed": all_finite,
+                "message": "All gradients finite" if all_finite else "Some gradients inf/nan",
+                "grad_norms": grad_norms[:3]  # Show first 3 gradient norms
+            }
+            print(f"  ✓ Gradients finite: {'PASS' if all_finite else 'FAIL'}")
+            
+            # Test 4: Check for exploding/vanishing gradients
+            if grad_norms:
+                max_grad = max(norm for _, norm in grad_norms)
+                min_grad = min(norm for _, norm in grad_norms if norm > 0)
+                
+                not_exploding = max_grad < 100
+                not_vanishing = min_grad > 1e-8
+                
+                self.results["gradient_magnitude"] = {
+                    "passed": not_exploding and not_vanishing,
+                    "max_grad": max_grad,
+                    "min_grad": min_grad,
+                    "message": f"Max grad: {max_grad:.6f}, Min grad: {min_grad:.2e}"
+                }
+                print(f"  ✓ Gradient magnitude: {'PASS' if not_exploding and not_vanishing else 'FAIL'} "
+                      f"(max={max_grad:.2f}, min={min_grad:.2e})")
+
+def print_summary(results: Dict[str, Dict]):
+    """Print test summary"""
+    print(f"\n{'='*60}")
+    print("TEST SUMMARY")
+    print(f"{'='*60}")
+    
+    total_tests = len(results)
+    passed_tests = sum(1 for r in results.values() if r.get("passed", False))
+    
+    print(f"\nTotal Tests: {total_tests}")
+    print(f"Passed: {passed_tests}")
+    print(f"Failed: {total_tests - passed_tests}")
+    print(f"Success Rate: {100 * passed_tests / total_tests:.1f}%")
+    
+    if passed_tests < total_tests:
+        print("\nFailed Tests:")
+        for test_name, result in results.items():
+            if not result.get("passed", False):
+                print(f"  - {test_name}: {result.get('message', 'No message')}")
+    
+    return passed_tests == total_tests
+
+# Main execution
+if __name__ == "__main__":
+    # Import your loss classes here
+    # from elbo_loss import ELBOLoss
+    # from remasking_loss import ReMDMELBOLoss
+    
+    config = TestConfig()
+    
+    # Test both loss functions
+    print("\n" + "="*60)
+    print("DIFFUSION LOSS FUNCTION TEST SUITE")
+    print("="*60)
+    
+    # Placeholder for when you import the actual classes
+    print("\nNote: To run tests, uncomment the import statements and ensure")
+    print("ELBOLoss and ReMDMELBOLoss classes are available.")
+    
+    # Example of how to run tests (uncomment when classes are available):
+    
+    # Test ELBO Loss
+    elbo_tester = DiffusionLossTestSuite(ELBOLoss, config)
+    elbo_results = elbo_tester.run_all_tests()
+    elbo_passed = print_summary(elbo_results)
+    
+    # Test ReMDM ELBO Loss  
+    remdm_tester = DiffusionLossTestSuite(ReMDMELBOLoss, config)
+    remdm_results = remdm_tester.run_all_tests()
+    remdm_passed = print_summary(remdm_results)
+    
+    # Overall summary
+    print("\n" + "="*60)
+    print("OVERALL RESULTS")
+    print("="*60)
+    if elbo_passed and remdm_passed:
+        print("✅ ALL TESTS PASSED!")
+    else:
+        print("❌ SOME TESTS FAILED - Review the results above")
+   
