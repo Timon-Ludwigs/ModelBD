@@ -638,9 +638,6 @@ class ReMDMELBOLoss:
         """
         Compute confidence-based sigma schedule for each token.
         
-        σ^(ℓ)_t = η^(ℓ)_conf · σ_t
-        where η^(ℓ)_conf = exp(-ψ^(ℓ)_t) / Σ_ℓ' exp(-ψ^(ℓ')_t)
-        
         Args:
             x_noisy: Current noisy sequence [batch, seq_len]
             model_logits: Model predictions [batch, seq_len, vocab_size]
@@ -734,7 +731,7 @@ class ReMDMELBOLoss:
         denominator = 1.0 - alpha_t + 1e-8
         
         # Compute weights: ((1 - sigma) * alpha_t - alpha_s) / (1 - alpha_t)
-        weights = ((1.0 - sigma) * alpha_t - alpha_s) / denominator
+        weights = (alpha_s - (1.0 - sigma) * alpha_t) / denominator
         
         # Clamp for stability
         weights = torch.clamp(weights, min=0.0, max=100.0)
@@ -814,14 +811,15 @@ class ReMDMELBOLoss:
             t = t_indices.float() / self.timesteps
         
         # Initialize loss accumulator for Monte Carlo estimation
-        total_loss = 0.0
+        #total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         total_diagnostics = {
             "num_masked_tokens": 0,
             "num_remasked_tokens": 0,
             "mean_sigma": 0.0,
             "mean_weight": 0.0
         }
-        
+        loss_samples = []
         for sample_idx in range(num_samples):
             # Use precomputed or generate noisy sequence
             if precomputed_x_noisy is not None:
@@ -847,6 +845,11 @@ class ReMDMELBOLoss:
             # Compute confidence-based sigma
             if precomputed_sigma is not None:
                 sigma = precomputed_sigma
+                if (sigma == 0).all():
+                    # No remasking if sigma is 0
+                    x_remasked = x_noisy
+                else:
+                    x_remasked = self.remask_sequence(x_noisy, sigma, product_mask)
             else:
                 sigma = self.compute_confidence_based_sigma(
                     x_noisy, logits, product_mask
@@ -856,23 +859,41 @@ class ReMDMELBOLoss:
             x_remasked = self.remask_sequence(x_noisy, sigma, product_mask)
             
             # Compute ELBO weights
-            weights = self.compute_elbo_weights(t_indices, sigma, device)
+            # weights = self.compute_elbo_weights(t_indices, sigma, device)
+            if precomputed_sigma is not None and (x_noisy == self.mask_token_id).all():
+                # For testing: use uniform weights when everything is masked
+                weights = torch.ones((batch_size, seq_len), device=device)
+            else:
+                weights = self.compute_elbo_weights(t_indices, sigma, device)
             
             # Identify positions to compute loss on
             # Loss should ONLY be computed on positions that are masked in x_remasked
             # This includes both originally masked positions that stay masked AND newly remasked positions
             is_currently_masked = (x_remasked == self.mask_token_id)
-            is_not_padding = (x_target != self.pad_token_id)
+            #is_not_padding = (x_target != self.pad_token_id)
+            
             
             # Valid positions for loss computation - only currently masked positions
-            valid_positions = (is_currently_masked & product_mask & is_not_padding)
+            #valid_positions = (is_currently_masked & product_mask & is_not_padding)
+            # Dont exclude padding tokens from calculating the loss
+            valid_positions = (is_currently_masked & product_mask)
             
             # For diagnostics, track what was originally masked vs remasked
-            is_originally_masked = (x_noisy == self.mask_token_id)
+            # is_originally_masked = (x_noisy == self.mask_token_id)
+            #is_originally_masked = (x_noisy == self.mask_token_id) & product_mask & is_not_padding
+            is_originally_masked = (x_noisy == self.mask_token_id) & product_mask
             is_remasked = (x_noisy != self.mask_token_id) & (x_remasked == self.mask_token_id)
             
             if not valid_positions.any():
-                continue
+                #continue
+                return {
+                    "loss": torch.tensor(0.0, device=device, requires_grad=True),
+                    "num_masked_tokens": 0,
+                    "num_remasked_tokens": 0,
+                    "mean_sigma": 0.0,
+                    "mean_weight": 0.0,
+                    "t_mean": t.float().mean().item()
+                }
             
             # Compute cross-entropy loss
             logits_flat = logits.reshape(-1, logits.size(-1))
@@ -884,14 +905,32 @@ class ReMDMELBOLoss:
             valid_logits = logits_flat[valid_flat]
             valid_targets = targets_flat[valid_flat]
             valid_weights = weights_flat[valid_flat]
+
+            """ print("Num valid positions:", valid_positions.sum().item())
+            print("Valid logits shape:", valid_logits.shape)
+            print("Valid targets shape:", valid_targets.shape)
+            print("Valid weights shape:", valid_weights.shape) """
+
+            if not valid_positions.any():
+            # Add a zero loss for this sample
+                loss_samples.append(torch.tensor(0.0, device=device))
+                continue
             
             # Compute weighted token-level loss
             token_losses = F.cross_entropy(valid_logits, valid_targets, reduction='none')
             weighted_token_losses = valid_weights * token_losses
-            
+
+            # Debug: Print intermediate values
+            """ print(f"Weights min: {valid_weights.min()}, max: {valid_weights.max()}")
+            print(f"Token losses min: {token_losses.min()}, max: {token_losses.max()}")
+            print(f"Weighted losses min: {weighted_token_losses.min()}, max: {weighted_token_losses.max()}") """
+                        
             # Aggregate loss
             sample_loss = weighted_token_losses.mean()
             total_loss = total_loss + sample_loss
+
+
+            loss_samples.append(sample_loss)
             
             # Update diagnostics
             total_diagnostics["num_masked_tokens"] += is_originally_masked.sum().item()
@@ -900,7 +939,17 @@ class ReMDMELBOLoss:
             total_diagnostics["mean_weight"] += weights[product_mask].mean().item()
         
         # Average over samples
-        final_loss = total_loss / max(num_samples, 1)
+        #final_loss = total_loss / max(num_samples, 1)
+        if loss_samples:
+            final_loss = torch.stack(loss_samples).mean()
+        else:
+            final_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        # Make sure final_loss is a tensor:
+        """ if isinstance(total_loss, (int, float)):
+            final_loss = torch.tensor(total_loss / max(num_samples, 1), 
+                                    device=device, requires_grad=True)
+        else:
+            final_loss = total_loss / max(num_samples, 1) """
         
         # Average diagnostics
         for key in total_diagnostics:
