@@ -17,7 +17,7 @@ class ELBOLoss:
                 - timesteps: int
                 - mask_token_id: int
                 - pad_token_id: int
-                - noise_schedule: str ("linear", "cosine", "geometric")
+                - noise_schedule: str ("linear", "cosine")
         """
         self.config = config
         self.mask_token_id = config.mask_token_id
@@ -41,14 +41,11 @@ class ELBOLoss:
             alphas = 1 - t
         elif self.config.noise_schedule == "cosine":
             alphas = torch.cos(torch.pi / 2 * t)
-        elif self.config.noise_schedule == "geometric":
-            beta_min, beta_max = 1e-5, 20
-            alphas = torch.exp(-beta_min * (1-t) * beta_max**t)
         else:
             # Default to cosine
             alphas = torch.cos(torch.pi / 2 * t)
         
-        # Ensure alpha[0] = 1.0 (no noise at t=0)
+        # Ensure alpha[0] = 1.0 (no noise at t=0, so prob. of keeping the token should be 1 at that stage)
         alphas[0] = 1.0
         
         return alphas
