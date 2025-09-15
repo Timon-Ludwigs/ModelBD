@@ -55,7 +55,8 @@ class ELBOLoss:
         Compute ELBO weights w(t) and importance sampling distribution q(t).
         
         w(t) = (alpha_{t-1} - alpha_t) / (1 - alpha_t)
-        q(t) ∝ w(t) for variance reduction
+        q(t) proportional to w(t) for variance reduction
+        So, normalize w(t), to make it a valid prob. distrib.: q(t) = w(t)/(sum w(j))
         
         Returns:
             weights: Shape (timesteps,) - the w(t) values
@@ -75,7 +76,7 @@ class ELBOLoss:
             
             # Compute weight with clamping for stability
             w_t = (alpha_s - alpha_t) / denominator
-            w_t = torch.clamp(w_t, min=0.0, max=100.0)  # Prevent extreme weights
+            # w_t = torch.clamp(w_t, min=0.0, max=100.0)  # Prevent extreme weights
             # store weights
             weights[t - 1] = w_t
         
