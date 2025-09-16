@@ -589,6 +589,7 @@ class ReMDMELBOLoss:
                 - noise_schedule: str ("linear", "cosine", "geometric")
                 - base_sigma: float (base remasking probability, default 0.5)
                 - temperature: float (for confidence score softmax, default 1.0)
+                - sampling_sampler: str (sampling method, e.g., 'remdm-conf')
         """
         self.config = config
         self.mask_token_id = config.mask_token_id
@@ -601,7 +602,7 @@ class ReMDMELBOLoss:
         self.alphas = self._build_alpha_schedule()
         
         # Store confidence scores for each position
-        self.confidence_scores = {}  # Will store per-sequence confidence
+        self.confidence_scores = {}
         
     def _build_alpha_schedule(self) -> torch.Tensor:
         """
@@ -614,9 +615,6 @@ class ReMDMELBOLoss:
             alphas = 1 - t
         elif self.config.noise_schedule == "cosine":
             alphas = torch.cos(torch.pi / 2 * t)
-        elif self.config.noise_schedule == "geometric":
-            beta_min, beta_max = 1e-5, 20
-            alphas = torch.exp(-beta_min * (1-t) * beta_max**t)
         else:
             # Default to cosine
             alphas = torch.cos(torch.pi / 2 * t)
@@ -626,6 +624,143 @@ class ReMDMELBOLoss:
         
         return alphas
     
+    def compute_confidence_based_sigma_github_style(
+        self,
+        x_noisy: torch.Tensor,
+        model_logits: torch.Tensor,
+        product_mask: torch.Tensor,
+        alpha_t: float,
+        alpha_s: float,
+        conf: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute confidence-based sigma and sampling probabilities using GitHub-style approach.
+        
+        Args:
+            x_noisy: Current noisy sequence [batch, seq_len]
+            model_logits: Model predictions [batch, seq_len, vocab_size]
+            product_mask: Boolean mask for product positions [batch, seq_len]
+            alpha_t: Current timestep alpha value
+            alpha_s: Previous timestep alpha value  
+            conf: Current confidence scores [batch, seq_len]
+            
+        Returns:
+            sigma: Per-token remasking probabilities [batch, seq_len]
+            q_xs: Sampling probabilities [batch, seq_len, vocab_size]
+        """
+        batch_size, seq_len, vocab_size = model_logits.shape
+        device = x_noisy.device
+        
+        # Get model probabilities
+        p_x0 = F.softmax(model_logits, dim=-1) 
+        
+        # Compute sigma_max
+        if alpha_t > 0:
+            sigma_max = min(1.0, (1 - alpha_s) / alpha_t)
+        else:
+            sigma_max = 1.0
+        
+        # Compute eta (normalized confidence scores)
+        eta = F.softmax(conf, dim=-1)
+        
+        # Zero out confidence for already masked positions
+        masked_flag = (x_noisy == self.mask_token_id).to(torch.bool)
+        # set their confidence weight to 0
+        eta[masked_flag] = 0
+        
+        # Compute sigma per token
+        sigma = eta * sigma_max
+        
+        # Compute q_xs (probability distribution for sampling)
+        # For unmasked tokens: q_xs = p_x0 * (1 - sigma)
+        # With prob. 1-sigma keep the models distributions
+        # With prob. sigma replace with mask token
+        q_xs = p_x0 * (1 - sigma.unsqueeze(-1))
+        q_xs[..., self.mask_token_id] = sigma  # Set mask token probability to sigma
+        
+        # Compute q_xs_2 (alternative distribution for masked tokens)
+        if alpha_t > 0:
+            weight_factor = (alpha_s - (1 - sigma.unsqueeze(-1)) * alpha_t) / (1 - alpha_t)
+            q_xs_2 = p_x0 * weight_factor
+            mask_prob_2 = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+            q_xs_2[..., self.mask_token_id] = mask_prob_2.unsqueeze(-1)
+        else:
+            q_xs_2 = q_xs.clone()
+        
+        # Select between q_xs and q_xs_2 based on whether token is currently masked
+        # If token is not masked use q_xs
+        # If it is masked usw q_xs_2
+        copy_flag = (x_noisy != self.mask_token_id).to(torch.bool)
+        q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+        
+        # Ensure probabilities are non-negative and normalized
+        q_xs = torch.clamp(q_xs, min=1e-10)
+        q_xs = q_xs / q_xs.sum(dim=-1, keepdim=True)
+        
+        return sigma, q_xs
+    
+    def sample_categorical(self, probs: torch.Tensor) -> torch.Tensor:
+        """
+        Sample from categorical distribution.
+        
+        Args:
+            probs: Probabilities [batch, seq_len, vocab_size]
+            
+        Returns:
+            samples: Sampled tokens [batch, seq_len]
+        """
+        # Flatten for sampling
+        batch_size, seq_len, vocab_size = probs.shape
+        # Reshape so we can call multinomial once for all points
+        probs_flat = probs.reshape(-1, vocab_size)
+        
+        # Sample tokens using torch.multinomial (sample one token per position)
+        samples_flat = torch.multinomial(probs_flat, num_samples=1).squeeze(-1)
+        
+        # Reshape back (each entry is a sampled token ID)
+        samples = samples_flat.reshape(batch_size, seq_len)
+        
+        return samples
+    
+    def update_confidence_scores(
+        self,
+        x_prev: torch.Tensor,
+        x_new: torch.Tensor,
+        p_x0: torch.Tensor,
+        conf: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            x_prev: Previous sequence [batch, seq_len]
+            x_new: New sampled sequence [batch, seq_len]
+            p_x0: Model probabilities [batch, seq_len, vocab_size]
+            conf: Current confidence scores [batch, seq_len]
+            
+        Returns:
+            updated_conf: Updated confidence scores [batch, seq_len]
+        """
+        batch_size, seq_len = x_prev.shape
+        device = x_prev.device
+        
+        # Create batch and sequence indices (use for indexing per sequence and per position)
+        batch_indices = torch.arange(batch_size, device=device)[:, None]
+        feature_indices = torch.arange(seq_len, device=device)
+        
+        # Update confidence for newly unmasked tokens
+        # Get positions, where we need to assign a new confidence score, so was masked before
+        # and is now sampled into a real token
+        unmask_mask = (x_prev == self.mask_token_id) & (x_new != self.mask_token_id)
+        # Get the models predicted probability for the new token at each position
+        conf_values = -p_x0[batch_indices, feature_indices, x_new]  # Negative log prob -> lower prob. means lower confidence
+        # update conf for those newly unmasked tokens
+        conf[unmask_mask] = conf_values[unmask_mask]
+        
+        # Set confidence to -inf for newly remasked tokens
+        remask_mask = (x_prev != self.mask_token_id) & (x_new == self.mask_token_id)
+        conf[remask_mask] = float('-inf')
+        
+        return conf
+    
     def compute_confidence_based_sigma(
         self,
         x_noisy: torch.Tensor,
@@ -634,16 +769,8 @@ class ReMDMELBOLoss:
         batch_idx: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Compute confidence-based sigma schedule for each token.
-        
-        Args:
-            x_noisy: Current noisy sequence [batch, seq_len]
-            model_logits: Model predictions [batch, seq_len, vocab_size]
-            product_mask: Boolean mask for product positions [batch, seq_len]
-            batch_idx: Optional batch indices for tracking confidence
-            
-        Returns:
-            sigma: Per-token remasking probabilities [batch, seq_len]
+        Compute tokenwise sigma schedule based on model confidence. The less confident the model
+        is about a token, the more likely that token will be remasked in the next step.
         """
         batch_size, seq_len = x_noisy.shape
         device = x_noisy.device
@@ -669,7 +796,7 @@ class ReMDMELBOLoss:
             psi[is_unmasked] = token_probs[is_unmasked]
             
             # Store confidence scores for tracking (optional)
-            if batch_idx is not None:
+            """ if batch_idx is not None:
                 for b in range(batch_size):
                     key = batch_idx[b].item() if batch_idx is not None else b
                     if key not in self.confidence_scores:
@@ -677,7 +804,7 @@ class ReMDMELBOLoss:
                     
                     for s in range(seq_len):
                         if is_unmasked[b, s]:
-                            self.confidence_scores[key][(b, s)] = token_probs[b, s].item()
+                            self.confidence_scores[key][(b, s)] = token_probs[b, s].item() """
         
         # Compute eta_conf using negative psi (lower confidence -> higher remasking prob)
         # For masked tokens (psi = inf), exp(-psi) = 0, so they won't be remasked
@@ -687,9 +814,9 @@ class ReMDMELBOLoss:
         eta_conf = exp_neg_psi / (exp_neg_psi.sum(dim=1, keepdim=True) + 1e-10)
         
         # Scale by base sigma
-        sigma = eta_conf * self.base_sigma * seq_len  # Scale by seq_len to maintain expected number of remaskings
+        sigma = eta_conf * self.base_sigma
         
-        # Ensure masked tokens have sigma = 0 (they shouldn't be remasked)
+        # Ensure no remasking is assigned to masked tokens
         sigma[~is_unmasked] = 0.0
         
         return sigma
@@ -728,13 +855,48 @@ class ReMDMELBOLoss:
         # Compute denominator with stability
         denominator = 1.0 - alpha_t + 1e-8
         
-        # Compute weights: ((1 - sigma) * alpha_t - alpha_s) / (1 - alpha_t)
+        # Compute weights: ((1 - sigma) * alpha_t - alpha_s) / (1 - alpha_t), but change the 
+        # sign just like in the ELBO computation
         weights = (alpha_s - (1.0 - sigma) * alpha_t) / denominator
         
         # Clamp for stability
         weights = torch.clamp(weights, min=0.0, max=100.0)
         
         return weights
+    
+    def remask_sequence_github_style(
+        self,
+        x_current: torch.Tensor,
+        q_xs: torch.Tensor,
+        product_mask: torch.Tensor,
+        conf: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply remasking using GitHub-style categorical sampling.
+        
+        Args:
+            x_current: Current sequence [batch, seq_len]
+            q_xs: Sampling probabilities [batch, seq_len, vocab_size]
+            product_mask: Valid positions mask [batch, seq_len]
+            conf: Current confidence scores [batch, seq_len]
+            
+        Returns:
+            x_remasked: Sequence after remasking [batch, seq_len]
+            updated_conf: Updated confidence scores [batch, seq_len]
+        """
+        # Sample new tokens
+        x_new = self.sample_categorical(q_xs)
+        
+        # Only apply changes to valid positions
+        x_remasked = torch.where(product_mask, x_new, x_current)
+        
+        # Update confidence scores
+        p_x0 = q_xs  # Using q_xs as probability estimates
+        # If a new token was chosen, assign new confidence based on prob. of that token
+        # If a token was remasked, set confidence to -inf
+        updated_conf = self.update_confidence_scores(x_current, x_remasked, p_x0, conf.clone())
+        
+        return x_remasked, updated_conf
     
     def remask_sequence(
         self,
@@ -743,21 +905,16 @@ class ReMDMELBOLoss:
         product_mask: torch.Tensor
     ) -> torch.Tensor:
         """
-        Apply remasking based on sigma probabilities.
-        
-        Args:
-            x_current: Current sequence [batch, seq_len]
-            sigma: Remasking probabilities [batch, seq_len]
-            product_mask: Valid positions mask [batch, seq_len]
-            
-        Returns:
-            x_remasked: Sequence after remasking [batch, seq_len]
+        Apply remasking based on sigma probabilities (original method).
+        Kept for backward compatibility.
         """
         # Sample remasking decisions
         remask_prob = torch.rand_like(sigma)
         should_remask = (remask_prob < sigma) & product_mask
         
         # Apply remasking
+        # If should_remask is true, replace token with [MASK]
+        # If false, keep original token
         x_remasked = torch.where(should_remask, self.mask_token_id, x_current)
         
         return x_remasked
@@ -768,7 +925,8 @@ class ReMDMELBOLoss:
         x_target: torch.Tensor = None,
         product_mask: torch.Tensor = None,
         num_samples: int = 1,
-        # For testing - allow precomputed values
+        use_github_style: bool = False,
+        # For testing allow precomputed values
         precomputed_logits: torch.Tensor = None,
         precomputed_t: torch.Tensor = None,
         precomputed_x_noisy: torch.Tensor = None,
@@ -782,6 +940,7 @@ class ReMDMELBOLoss:
             x_target: Original sequence [batch, seq_len]
             product_mask: Boolean mask for product positions [batch, seq_len]
             num_samples: Number of samples for Monte Carlo estimation
+            use_github_style: Whether to use GitHub-style confidence sampling
             precomputed_logits: For testing - pre-computed model outputs
             precomputed_t: For testing - pre-computed timesteps
             precomputed_x_noisy: For testing - pre-computed noisy sequences
@@ -808,8 +967,12 @@ class ReMDMELBOLoss:
             t_indices = torch.randint(1, self.timesteps + 1, (batch_size,), device=device)
             t = t_indices.float() / self.timesteps
         
+        # Initialize confidence scores
+        if use_github_style:
+            # get per token confidencce, start with all zeros
+            conf = torch.zeros((batch_size, seq_len), device=device)
+        
         # Initialize loss accumulator for Monte Carlo estimation
-        #total_loss = 0.0
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         total_diagnostics = {
             "num_masked_tokens": 0,
@@ -818,7 +981,9 @@ class ReMDMELBOLoss:
             "mean_weight": 0.0
         }
         loss_samples = []
+        
         for sample_idx in range(num_samples):
+            # Forward diffusion:
             # Use precomputed or generate noisy sequence
             if precomputed_x_noisy is not None:
                 x_noisy = precomputed_x_noisy
@@ -840,50 +1005,52 @@ class ReMDMELBOLoss:
                 outputs = model(x_noisy, t)
                 logits = outputs["logits"]
             
-            # Compute confidence-based sigma
-            if precomputed_sigma is not None:
-                sigma = precomputed_sigma
-                if (sigma == 0).all():
-                    # No remasking if sigma is 0
-                    x_remasked = x_noisy
-                else:
-                    x_remasked = self.remask_sequence(x_noisy, sigma, product_mask)
-            else:
-                sigma = self.compute_confidence_based_sigma(
-                    x_noisy, logits, product_mask
+            # Choose remasking strategy
+            if use_github_style and getattr(self.config, 'sampling_sampler', None) == 'remdm-conf':
+                # Github-style confidence-based sampling
+                alpha_t_val = alphas[t_indices[0]].item()
+                alpha_s_val = alphas[t_indices[0] - 1].item() if t_indices[0] > 1 else 1.0
+                # Compute per token sigma and categorical distrib. q_xs
+                sigma, q_xs = self.compute_confidence_based_sigma_github_style(
+                    x_noisy, logits, product_mask, alpha_t_val, alpha_s_val, conf
                 )
-            
-            # Apply remasking based on sigma
-            x_remasked = self.remask_sequence(x_noisy, sigma, product_mask)
+                # Sample a new sequence and update conf
+                x_remasked, conf = self.remask_sequence_github_style(
+                    x_noisy, q_xs, product_mask, conf
+                )
+            else:
+                # Original sigma-based remasking
+                if precomputed_sigma is not None:
+                    sigma = precomputed_sigma
+                    if (sigma == 0).all():
+                        x_remasked = x_noisy
+                    else:
+                        x_remasked = self.remask_sequence(x_noisy, sigma, product_mask)
+                else:
+                    sigma = self.compute_confidence_based_sigma(
+                        x_noisy, logits, product_mask
+                    )
+                    x_remasked = self.remask_sequence(x_noisy, sigma, product_mask)
             
             # Compute ELBO weights
-            # weights = self.compute_elbo_weights(t_indices, sigma, device)
+            # Fot the test case with all maked set weights to 1
             if precomputed_sigma is not None and (x_noisy == self.mask_token_id).all():
-                # For testing: use uniform weights when everything is masked
                 weights = torch.ones((batch_size, seq_len), device=device)
             else:
                 weights = self.compute_elbo_weights(t_indices, sigma, device)
             
             # Identify positions to compute loss on
-            # Loss should ONLY be computed on positions that are masked in x_remasked
-            # This includes both originally masked positions that stay masked AND newly remasked positions
+            # Only compute loss on tokens that are still masked and in product region
             is_currently_masked = (x_remasked == self.mask_token_id)
-            #is_not_padding = (x_target != self.pad_token_id)
-            
-            
-            # Valid positions for loss computation - only currently masked positions
-            #valid_positions = (is_currently_masked & product_mask & is_not_padding)
-            # Dont exclude padding tokens from calculating the loss
             valid_positions = (is_currently_masked & product_mask)
             
-            # For diagnostics, track what was originally masked vs remasked
-            # is_originally_masked = (x_noisy == self.mask_token_id)
-            #is_originally_masked = (x_noisy == self.mask_token_id) & product_mask & is_not_padding
+            # Track which tokens were initially masked and which ones got remasked
             is_originally_masked = (x_noisy == self.mask_token_id) & product_mask
             is_remasked = (x_noisy != self.mask_token_id) & (x_remasked == self.mask_token_id)
             
+            # Handle edge cases
+            # If nothing is masked return 0 loss
             if not valid_positions.any():
-                #continue
                 return {
                     "loss": torch.tensor(0.0, device=device, requires_grad=True),
                     "num_masked_tokens": 0,
@@ -904,30 +1071,16 @@ class ReMDMELBOLoss:
             valid_targets = targets_flat[valid_flat]
             valid_weights = weights_flat[valid_flat]
 
-            """ print("Num valid positions:", valid_positions.sum().item())
-            print("Valid logits shape:", valid_logits.shape)
-            print("Valid targets shape:", valid_targets.shape)
-            print("Valid weights shape:", valid_weights.shape) """
-
             if not valid_positions.any():
-            # Add a zero loss for this sample
                 loss_samples.append(torch.tensor(0.0, device=device))
                 continue
             
             # Compute weighted token-level loss
             token_losses = F.cross_entropy(valid_logits, valid_targets, reduction='none')
             weighted_token_losses = valid_weights * token_losses
-
-            # Debug: Print intermediate values
-            """ print(f"Weights min: {valid_weights.min()}, max: {valid_weights.max()}")
-            print(f"Token losses min: {token_losses.min()}, max: {token_losses.max()}")
-            print(f"Weighted losses min: {weighted_token_losses.min()}, max: {weighted_token_losses.max()}") """
                         
             # Aggregate loss
             sample_loss = weighted_token_losses.mean()
-            total_loss = total_loss + sample_loss
-
-
             loss_samples.append(sample_loss)
             
             # Update diagnostics
@@ -937,17 +1090,10 @@ class ReMDMELBOLoss:
             total_diagnostics["mean_weight"] += weights[product_mask].mean().item()
         
         # Average over samples
-        #final_loss = total_loss / max(num_samples, 1)
         if loss_samples:
             final_loss = torch.stack(loss_samples).mean()
         else:
             final_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        # Make sure final_loss is a tensor:
-        """ if isinstance(total_loss, (int, float)):
-            final_loss = torch.tensor(total_loss / max(num_samples, 1), 
-                                    device=device, requires_grad=True)
-        else:
-            final_loss = total_loss / max(num_samples, 1) """
         
         # Average diagnostics
         for key in total_diagnostics:
