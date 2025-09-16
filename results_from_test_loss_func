@@ -1,0 +1,284 @@
+======================================================================
+               ReMDM ELBO LOSS COMPREHENSIVE TEST SUITE
+======================================================================
+==================================================
+TEST 1: MATHEMATICAL PROPERTIES
+==================================================
+
+1.1 Non-negativity test
+Loss is non-negative: 14.9317
+
+1.2 Finite values test...
+Loss is finite: 14.9317
+
+1.3 Differentiability test...
+Loss is differentiable (grad_fn: MeanBackward0)
+
+1.4 Tensor properties test
+Loss is scalar tensor
+
+==================================================
+TEST 2: GRADIENT FLOW
+==================================================
+
+2.1 Gradient existence test...
+Gradients flow properly through the loss
+
+2.2 Gradient magnitude test
+Gradient norms: max=0.0069, mean=0.0034
+
+==================================================
+TEST 3: BEHAVIORAL PROPERTIES
+==================================================
+
+3.1 Random baseline test...
+Base cross-entropy: 6.9078
+Mean weight: 0.0376
+Expected loss (CE * weight): 0.2599
+Actual loss: 0.2774
+
+3.2 Perfect prediction test
+Perfect prediction loss: 0.000000
+Perfect prediction gives low loss (< 0.04)
+
+3.3 Monotonicity test
+Losses with increasing noise: ['0.000000072', '0.000000081', '0.000000092', '0.000000117', '0.000000176']
+Loss generally increases with prediction noise
+
+==================================================
+TEST 4: MASKING AND REMASKING BEHAVIOR
+==================================================
+
+4.1 Basic masking statistics test...
+Originally masked tokens: 33.0
+Remasked tokens: 0.0
+Mean sigma: 0.0156
+Masking statistics are valid
+
+4.2 Confidence-based remasking test
+Mean sigma (high confidence): 0.0156
+Mean sigma (low confidence): 0.0156
+Confidence-based remasking implemented
+
+4.3 Padding handling test
+Padding positions are properly excluded
+
+4.4 Product mask test
+Max possible masked (with product_mask): 88
+Actually masked: 47.0
+Product mask properly restricts loss computation
+
+==================================================
+TEST 5: TIMESTEP SAMPLING AND WEIGHTS
+==================================================
+
+5.1 Timestep distribution test
+Timestep distribution: mean=0.504, std=0.152
+Timestep sampling produces valid distribution
+
+5.2 Weight computation test
+Mean weight: 1.221
+Weights are reasonable
+
+5.3 Sigma computation test
+Mean sigma: 0.015
+Sigma values are in valid range
+
+==================================================
+TEST 6: EDGE CASES
+==================================================
+
+6.1 Empty mask test
+Handles empty mask correctly
+
+6.2 All padding test
+Handles all-padding input correctly
+
+6.3 Single token test...
+Single token loss: 0.0000
+
+6.4 Large batch test...
+Large batch loss: 0.2627
+
+==================================================
+TEST 7: NUMERICAL STABILITY
+==================================================
+
+7.1 Extreme logits test...
+Handles extreme logits: loss=12.4027
+
+7.2 Small probabilities test
+Handles small probabilities: loss=0.0000
+
+7.3 Alpha schedule stability test
+Stable at schedule boundaries: t≈0 loss=0.0000, t≈1 loss=0.1191
+
+7.4 Sigma computation stability test
+Sigma computation stable with extreme inputs
+
+======================================================================
+                         TEST SUMMARY
+======================================================================
+Correct Mathematical Properties: PASSED
+Correct Gradient Flow: PASSED
+Correct Behavioral Properties: PASSED
+Correct Masking and Remasking Behavior: PASSED
+Correct Timestep Sampling and Weights: PASSED
+Correct Edge Cases: PASSED
+Correct Numerical Stability: PASSED
+
+----------------------------------------------------------------------
+Results: 7/7 tests passed
+
+======================================================================
+                    ELBO LOSS COMPREHENSIVE TEST SUITE
+               (Updated for Padding Inclusion Behavior)
+======================================================================
+==================================================
+TEST 1: MATHEMATICAL PROPERTIES
+==================================================
+
+1.1 Non-negativity test
+Loss is non-negative: 299.1258
+
+1.2 Finite values test
+Loss is finite: 299.1258
+
+1.3 Differentiability test
+Loss is differentiable (grad_fn: MeanBackward0)
+
+1.4 Tensor properties test
+Loss is scalar tensor
+
+==================================================
+TEST 2: GRADIENT FLOW
+==================================================
+
+2.1 Gradient existence test
+Gradients flow properly through the loss
+
+2.2 Gradient magnitude test
+Gradient norms: max=9.8939, mean=4.9469
+
+==================================================
+TEST 3: BEHAVIORAL PROPERTIES
+==================================================
+
+3.1 Random baseline test (with importance weights)
+Base cross-entropy: 6.9078
+Importance weight: 3.7623
+Expected loss (CE * weight): 25.9891
+Actual loss: 901.8822
+
+3.2 Perfect prediction test
+Perfect prediction loss: 0.000523
+Perfect prediction gives low loss (< 3.76)
+
+3.3 Monotonicity test
+Losses with increasing noise: ['0.0005', '0.0006', '0.0007', '0.0009', '0.0012']
+Loss generally increases with prediction noise
+
+==================================================
+TEST 4: MASKING BEHAVIOR
+==================================================
+
+4.1 Masked positions test
+Actual masked tokens: 28
+Reported masked tokens: 28
+Only masked positions contribute to loss
+
+4.2 Padding handling test...
+Masked padding positions: 20
+These now contribute to loss (for EOS learning)
+Padding positions included when masked (enables EOS learning)
+
+4.3 Product mask test...
+Max possible masked (with product_mask): 88
+Actually masked: 88
+Product mask properly restricts loss computation
+
+==================================================
+TEST 5: TIMESTEP SAMPLING
+==================================================
+
+5.1 Importance sampling distribution test
+Timestep distribution: mean=0.215, std=0.130
+Importance sampling produces valid timestep distribution
+
+5.2 Uniform sampling test...
+Uniform timestep distribution: mean=0.512
+Uniform sampling works correctly
+
+5.3 Importance weights test
+Mean importance weight: 7.854
+Correct importance weights are reasonable
+
+==================================================
+TEST 6: EDGE CASES
+==================================================
+
+6.1 Empty mask test
+Correct handles empty mask correctly
+
+6.2 All padding test
+Perfect padding prediction loss: 0.000126
+Correct perfect padding predictions have low loss
+Random predictions on padding targets loss: 162.0911
+Correct random predictions on padding targets have higher loss
+
+6.3 Single token test
+Correct single token loss: 0.0000
+
+6.4 Large batch test...
+Correct large batch loss: 523.1005
+
+==================================================
+TEST 7: NUMERICAL STABILITY
+==================================================
+
+7.1 Extreme logits test
+Correct handles extreme logits: loss=13659.6221
+
+7.2 Small probabilities test
+Correct handles small probabilities: loss=0.0000
+
+7.3 Alpha schedule stability test
+Correct stable at schedule boundaries: t≈0 loss=0.0000, t≈1 loss=1974.3555
+
+==================================================
+TEST 8: PADDING INCLUSION BEHAVIOR
+==================================================
+
+8.1 EOS token learning test...
+EOS positions masked: 12
+Loss includes EOS learning: 175.2608
+Correct EOS positions contribute to loss when masked
+
+8.2 Wrong padding generation penalty test
+Loss when predicting wrong padding: 257.6923
+This should be high to penalize incorrect padding generation
+
+8.3 Correct vs incorrect EOS prediction test
+Correct EOS prediction loss: 0.6197
+Wrong EOS prediction loss: 83.2738
+✓ Model learns to predict EOS tokens correctly
+
+Padding inclusion testing complete:
+- Enables EOS token learning
+- Penalizes wrong padding generation
+- Differentiates between correct and incorrect EOS placement
+
+======================================================================
+                         TEST SUMMARY
+======================================================================
+Correct Mathematical Properties: PASSED
+Correct Gradient Flow: PASSED
+Correct Behavioral Properties: PASSED
+Correct Masking Behavior: PASSED
+Correct Timestep Sampling: PASSED
+Correct Edge Cases: PASSED
+Correct Numerical Stability: PASSED
+Correct Padding Inclusion Behavior: PASSED
+
+----------------------------------------------------------------------
+Results: 8/8 tests passed
