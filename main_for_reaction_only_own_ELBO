@@ -1,0 +1,176 @@
+# Main training script with ELBO loss integration
+import torch
+import random
+from basic_diffusion_model_with_own_ELBO import (
+    ReactionMD4Config, ReactionMD4, ReactionDataset,
+    train_reaction_md4_with_elbo, test_model,
+    MetricsTracker, GeneratedExampleSampler,
+    enhanced_generate_examples_during_training,
+    calculate_accuracy_fixed
+)
+from discrete_diffusion_language_models.src.tokenizer import CustomTokenizer
+
+if __name__ == "__main__":
+    
+    # Load your data
+    print("Loading reaction data...")
+    with open("/home/gpwuq/ipms-foundation_model/data/interim/clean_corpus_only_reactions.txt") as f:
+        reactions = [line.strip() for line in f if line.strip()]
+    
+    print(f"Loaded {len(reactions)} reactions")
+    
+    # Initialize tokenizer
+    tokenizer = CustomTokenizer("/home/gpwuq/ipms-foundation_model/data/interim/clean_vocab_only_reactions_smiles_combined.json")
+    
+    # Configuration with ELBO loss enabled
+    config = ReactionMD4Config(
+        vocab_size=len(tokenizer.vocab),
+        max_seq_length=230,
+        d_model=512,
+        n_layers=6,
+        n_heads=8,
+        d_ff=2048,
+        dropout=0.1,
+        max_product_tokens=82,
+        mask_token_id=2,
+        reactant_sep_token_id=25,
+        pad_token_id=0,
+        eos_token_id=tokenizer.eos_token_id,
+        noagent_token_id=tokenizer.noagent_token_id,
+        noise_schedule="cosine",
+        timesteps=1000,
+        use_elbo_loss=True  # Enable ELBO loss
+    )
+    
+    print(f"\nUsing configuration:")
+    print(f"  max_seq_length: {config.max_seq_length}")
+    print(f"  max_product_tokens: {config.max_product_tokens}")
+    print(f"  vocab_size: {config.vocab_size}")
+    print(f"  noise_schedule: {config.noise_schedule}")
+    print(f"  timesteps: {config.timesteps}")
+    print(f"  use_elbo_loss: {config.use_elbo_loss}")
+    
+    # Shuffle and split data
+    random.shuffle(reactions)
+    
+    train_size = int(0.8 * len(reactions))
+    val_size = int(0.1 * len(reactions))
+    
+    train_data = reactions[:train_size]
+    val_data = reactions[train_size:train_size+val_size]
+    test_data = reactions[train_size+val_size:]
+    
+    print(f"\nData split:")
+    print(f"  Train: {len(train_data):,} samples")
+    print(f"  Val: {len(val_data):,} samples") 
+    print(f"  Test: {len(test_data):,} samples")
+    
+    # Initialize model
+    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    model = ReactionMD4(config).to(device)
+    
+    # Create datasets
+    train_dataset = ReactionDataset(train_data, tokenizer, config)
+    val_dataset = ReactionDataset(val_data, tokenizer, config)
+    test_dataset = ReactionDataset(test_data, tokenizer, config)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"\nModel initialized:")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    print(f"  Model size: ~{total_params * 4 / 1024**2:.1f} MB")
+    
+    # Verify ELBO loss is initialized
+    if hasattr(model, 'elbo_loss'):
+        print(f"\nELBO loss module initialized")
+        print(f"  Weights computed: {len(model.elbo_loss.weights)}")
+        print(f"  Sampling probs sum: {model.elbo_loss.sampling_probs.sum():.4f}")
+    else:
+        print(f"\nELBO loss module NOT found - check configuration")
+    
+    # Training parameters
+    examples_per_epoch = 75
+    num_epochs = 20
+    
+    print(f"\nTraining configuration:")
+    print(f"  Examples per epoch: {examples_per_epoch}")
+    print(f"  Number of epochs: {num_epochs}")
+    print(f"  Batch size: 32")
+    print(f"  Learning rate: 1e-4")
+    print(f"  Loss type: ELBO with importance sampling")
+    
+    # Training with ELBO loss
+    print(f"\nStarting training with ELBO loss...")
+    
+    metrics_tracker = train_reaction_md4_with_elbo(
+        model=model,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        tokenizer=tokenizer,
+        num_epochs=num_epochs,
+        batch_size=32,
+        learning_rate=1e-4,
+        validation_freq=1,
+        save_dir="training_logs_elbo_diffusion_with_own_ELBO",
+        examples_per_epoch=examples_per_epoch,
+        use_elbo_loss=True  # Explicitly use ELBO loss
+    )
+    
+    print("\n Training complete! Check 'training_logs_elbo_diffusion_with_own_ELBO' directory for:")
+    print("  - training_metrics_*.png: Comprehensive plots")
+    print("  - metrics_*.json: Raw metrics data")
+    print("  - generated_examples_*.json: Generated examples")
+    print("  - best_model_elbo.pt: Best model checkpoint")
+    
+    # Final test evaluation
+    print("\n" + "="*80)
+    print("RUNNING FINAL TEST EVALUATION WITH ELBO-TRAINED MODEL")
+    print("="*80)
+    
+    test_results = test_model(
+        model=model,
+        test_dataset=test_dataset,
+        tokenizer=tokenizer,
+        batch_size=32,
+        num_steps=100
+    )
+    
+    print(f"\n TRAINING COMPLETED WITH ELBO LOSS!")
+    print(f"Final test token accuracy: {test_results['token_accuracy']:.4f}")
+    print(f"Final test sequence accuracy: {test_results['sequence_accuracy']:.4f}")
+    
+    # Save the trained model with ELBO information
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': config,
+        'test_results': test_results,
+        'use_elbo_loss': True,
+        'elbo_weights': model.elbo_loss.weights.cpu() if hasattr(model, 'elbo_loss') else None,
+        'elbo_sampling_probs': model.elbo_loss.sampling_probs.cpu() if hasattr(model, 'elbo_loss') else None
+    }, 'reaction_md4_elbo.pt')
+    print("Model saved as 'reaction_md4_elbo.pt'")
+    
+    # Optional: Compare with standard loss training
+    print("\n" + "="*80)
+    print("Optional: To compare with standard loss, you can run:")
+    print("="*80)
+    print("""
+    # Create a new model with ELBO disabled
+    config_standard = ReactionMD4Config(
+        # ... same parameters ...
+        use_elbo_loss=False  # Disable ELBO
+    )
+    model_standard = ReactionMD4(config_standard).to(device)
+    
+    # Train with standard loss
+    metrics_tracker_standard = train_reaction_md4_with_elbo(
+        model=model_standard,
+        # ... same parameters ...
+        use_elbo_loss=False,  # Use standard loss
+        save_dir="training_logs_standard_diffusion"
+    )
+    """)
