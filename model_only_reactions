@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +15,7 @@ from datetime import datetime
 import os
 sys.path.append(".")
 from discrete_diffusion_language_models.src.tokenizer import CustomTokenizer
+from loss_function.loss_implementations import ELBOLoss
 
 @dataclass
 class ReactionMD4Config:
@@ -35,6 +35,7 @@ class ReactionMD4Config:
     max_product_tokens: int = 82
     noise_schedule: str = "cosine"  # "linear", "cosine", "geometric"
     timesteps: int = 1000
+    use_elbo_loss: bool = True  # Flag to use ELBO loss
     
     def __post_init__(self):
         if self.mask_token_id == -1:
@@ -295,6 +296,10 @@ class ReactionMD4(nn.Module):
         self.output_head = nn.Linear(config.d_model, config.vocab_size)
         self.dropout = nn.Dropout(config.dropout)
         
+        # Initialize ELBO loss if enabled
+        if config.use_elbo_loss:
+            self.elbo_loss = ELBOLoss(config)
+        
         # Initialize weights
         self.apply(self._init_weights)
         
@@ -349,17 +354,22 @@ class ReactionMD4(nn.Module):
     # Standard transformer forward pass with time conditioning
     def forward(self, input_ids: torch.Tensor, t: torch.Tensor,
                 target_ids: Optional[torch.Tensor] = None,
-                product_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                product_mask: Optional[torch.Tensor] = None,
+                use_elbo_loss: bool = None) -> Dict[str, torch.Tensor]:
         """
         Forward pass of the model.
         
         Args:
             input_ids: Input token IDs [batch, seq_len]
-            t: Diffusion time steps [batch]
+            t: Diffusion time steps [batch] 
             target_ids: Target token IDs for training [batch, seq_len]
             product_mask: Boolean mask for product positions [batch, seq_len]
+            use_elbo_loss: Whether to use ELBO loss (overrides config if provided)
         """
         batch_size, seq_len = input_ids.shape
+        
+        # Decide whether to use ELBO loss
+        use_elbo = use_elbo_loss if use_elbo_loss is not None else self.config.use_elbo_loss
 
         # Token embeddings
         token_emb = self.token_embedding(input_ids)  # [batch, seq_len, d_model]
@@ -382,32 +392,50 @@ class ReactionMD4(nn.Module):
         
         outputs = {"logits": logits}
         
-        # Compute loss during training (only on product positions)
-        # Check if targets are provided
+        # Compute loss during training
         if target_ids is not None and product_mask is not None:
-            # Check if there are any valid positions
-            if product_mask.any():
-                # Cross-entropy loss only on product positions by creating a mask for valid positions
-                # True for product tokens and positions that are not padding
-                # Create mask for positions that are currently masked AND in product region
-                is_masked = (input_ids == self.config.mask_token_id)
-                valid_positions = product_mask & (target_ids != self.config.pad_token_id) & is_masked
-                # valid_positions = product_mask & (target_ids != self.config.pad_token_id)
-                
-                # check if there are any valid positions left
-                if valid_positions.any():
-                    # Get the relevant tokens for calculating the CE
-                    valid_targets = target_ids[valid_positions]
-                    valid_logits = logits[valid_positions]
-                    
-                    # Compute CE loss and store it 
-                    loss = F.cross_entropy(valid_logits, valid_targets, reduction='mean')
-                    outputs["loss"] = loss
-                else:
-                    # For no product tokens return 0
-                    outputs["loss"] = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+            if use_elbo and hasattr(self, 'elbo_loss'):
+                # Use ELBO loss
+                elbo_results = self.elbo_loss.compute_elbo_loss(
+                    model=self,
+                    x_target=target_ids,
+                    product_mask=product_mask,
+                    use_importance_sampling=True,
+                    precomputed_logits=logits,
+                    precomputed_t=t,
+                    precomputed_x_noisy=input_ids
+                )
+                outputs["loss"] = elbo_results["loss"]
+                outputs["elbo_metrics"] = {
+                    "num_masked_tokens": elbo_results["num_masked_tokens"],
+                    "mean_importance_weight": elbo_results["mean_importance_weight"],
+                    "t_mean": elbo_results["t_mean"]
+                }
             else:
-                outputs["loss"] = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+                # Use original loss (fallback)
+                # Check if there are any valid positions
+                if product_mask.any():
+                    # Cross-entropy loss only on product positions by creating a mask for valid positions
+                    # True for product tokens and positions that are not padding
+                    # Create mask for positions that are currently masked AND in product region
+                    is_masked = (input_ids == self.config.mask_token_id)
+                    valid_positions = product_mask & (target_ids != self.config.pad_token_id) & is_masked
+                    
+                    # check if there are any valid positions left
+                    if valid_positions.any():
+                        # Get the relevant tokens for calculating the CE
+                        valid_targets = target_ids[valid_positions]
+                        valid_logits = logits[valid_positions]
+                        
+                        # Compute CE loss and store it 
+                        loss = F.cross_entropy(valid_logits, valid_targets, reduction='mean')
+                        outputs["loss"] = loss
+                    else:
+                        # For no product tokens return 0
+                        outputs["loss"] = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+                else:
+                    outputs["loss"] = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+        
         # return dict containing the loss and the logits
         return outputs
     
@@ -575,7 +603,6 @@ class ReactionMD4(nn.Module):
             return tokenizer.decode(product_tokens)
         else:
             return ""
-
 
 class ReactionDataset(Dataset):
     """Dataset for reaction SMILES strings."""
@@ -815,7 +842,6 @@ def test_model(model: ReactionMD4, test_dataset, tokenizer,
         print("No valid test samples found!")
         return {"token_accuracy": 0.0, "sequence_accuracy": 0.0, "num_samples": 0}
 
-
 @dataclass
 class TrainingMetrics:
     """Container for training metrics."""
@@ -967,7 +993,6 @@ class MetricsTracker:
             json.dump(self.generated_examples_history, f, indent=2)
         print(f"Generated examples saved to: {filename}")
 
-
 class GeneratedExampleSampler:
     """Smart sampling of generated examples during training."""
     
@@ -1009,7 +1034,7 @@ class GeneratedExampleSampler:
             step = max(1, dataset_size // self.max_examples_per_epoch)
             start = (epoch * 17) % step  # Use prime number to avoid patterns
             return list(range(start, dataset_size, step))[:self.max_examples_per_epoch]
-
+        
 def enhanced_generate_examples_during_training(model, val_dataset, tokenizer, 
                                              metrics_tracker, epoch, example_sampler,
                                              num_examples: int = 50):
@@ -1119,27 +1144,14 @@ def generate_examples_during_training_enhanced(model, dataset, tokenizer,
                         
             except Exception as e:
                 print(f"      Error generating example {i+1}: {str(e)}")
-    
-    # Add to metrics tracker
-    metrics_tracker.add_generated_examples(epoch, generated_examples)
-    
-    # Calculate summary statistics
-    correct_any_temp = sum(1 for ex in generated_examples 
-                          if any(var["is_correct"] for var in ex["generated_variants"]))
-    
-    print(f"      Generated {len(generated_examples)} examples")
-    print(f"      Correct products (any temp): {correct_any_temp}/{len(generated_examples)} ({100*correct_any_temp/max(len(generated_examples),1):.1f}%)")
-    
-    model.train()
-    return generated_examples
-
-
-def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
+        
+def train_reaction_md4_with_elbo(model, train_dataset, val_dataset, tokenizer,
                                num_epochs: int = 10, batch_size: int = 32,
                                learning_rate: float = 1e-4, validation_freq: int = 1,
-                               save_dir: str = "training_logs_fixed_ACC",
-                               examples_per_epoch: int = 50):
-    """Enhanced training loop with comprehensive metrics tracking."""
+                               save_dir: str = "training_logs_elbo",
+                               examples_per_epoch: int = 50,
+                               use_elbo_loss: bool = True):
+    """Training loop with ELBO loss support."""
     
     device = next(model.parameters()).device
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -1154,10 +1166,9 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
     
     best_val_loss = float('inf')
     
-    print(f"Starting enhanced training for {num_epochs} epochs...")
+    print(f"Starting training with {'ELBO' if use_elbo_loss else 'Standard'} loss for {num_epochs} epochs...")
     print(f"Train batches: {len(train_dataloader)}, Val batches: {len(val_dataloader)}")
     print(f"Saving metrics and examples to: {save_dir}")
-    print(f"Examples per epoch: {examples_per_epoch}")
     print("=" * 80)
     
     for epoch in range(num_epochs):
@@ -1168,6 +1179,10 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
         train_seq_acc = 0
         num_successful_batches = 0
         
+        # ELBO specific metrics
+        total_importance_weight = 0
+        total_masked_tokens = 0
+        
         pbar_train = tqdm(
             train_dataloader, 
             desc=f"Epoch {epoch+1}/{num_epochs} [Training]",
@@ -1177,46 +1192,69 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
         )
         
         for batch_idx, batch in enumerate(pbar_train):
-            x_masked = batch['x_masked'].to(device)
-            x_target = batch['x_target'].to(device) 
+            x_target = batch['x_target'].to(device)
             product_mask = batch['product_mask'].to(device)
             
-            batch_size_curr = x_masked.shape[0]
+            batch_size_curr = x_target.shape[0]
             
-            # Sample random time steps
-            t = torch.rand(batch_size_curr, device=device)
-            
-            # Forward diffusion (add noise to target based on schedule)
-            x_noisy = model.forward_sample(x_target, t, product_mask)
-            
-            # Forward pass
-            outputs = model(x_noisy, t, x_target, product_mask)
-            loss = outputs.get('loss', torch.tensor(0.0, device=device, requires_grad=True))
+            if use_elbo_loss and hasattr(model, 'elbo_loss'):
+                # ELBO loss handles timestep sampling internally
+                # We pass the target and let ELBO loss handle everything
+                elbo_results = model.elbo_loss.compute_elbo_loss(
+                    model=model,
+                    x_target=x_target,
+                    product_mask=product_mask,
+                    use_importance_sampling=True
+                )
+                
+                loss = elbo_results["loss"]
+                
+                # Track ELBO-specific metrics
+                if elbo_results["num_masked_tokens"] > 0:
+                    total_importance_weight += elbo_results["mean_importance_weight"]
+                    total_masked_tokens += elbo_results["num_masked_tokens"]
+                
+                # For accuracy calculation, we need the noisy input that was generated
+                # This is done internally in ELBO, so we need to recalculate for metrics
+                if product_mask.any():
+                    with torch.no_grad():
+                        # Sample t and create noisy input for accuracy calculation
+                        t = torch.rand(batch_size_curr, device=device)
+                        x_noisy = model.forward_sample(x_target, t, product_mask)
+                        outputs = model(x_noisy, t)
+                        logits = outputs["logits"]
+                        predictions = torch.argmax(logits, dim=-1)
+                        
+                        acc_metrics = calculate_accuracy_fixed(
+                            predictions, x_target, product_mask, 
+                            model.config.pad_token_id, x_noisy, model.config.mask_token_id
+                        )
+                        train_token_acc += acc_metrics["token_accuracy"]
+                        train_seq_acc += acc_metrics["sequence_accuracy"]
+                
+            else:
+                # Original training logic (non-ELBO)
+                t = torch.rand(batch_size_curr, device=device)
+                x_noisy = model.forward_sample(x_target, t, product_mask)
+                
+                outputs = model(x_noisy, t, x_target, product_mask, use_elbo_loss=False)
+                loss = outputs.get('loss', torch.tensor(0.0, device=device, requires_grad=True))
+                
+                if product_mask.any():
+                    with torch.no_grad():
+                        logits = outputs["logits"]
+                        predictions = torch.argmax(logits, dim=-1)
+                        
+                        acc_metrics = calculate_accuracy_fixed(
+                            predictions, x_target, product_mask, 
+                            model.config.pad_token_id, x_noisy, model.config.mask_token_id
+                        )
+                        train_token_acc += acc_metrics["token_accuracy"]
+                        train_seq_acc += acc_metrics["sequence_accuracy"]
             
             # Skip if no valid loss
             if loss.item() <= 0 or not loss.requires_grad:
                 continue
-            
-            # Calculate accuracy
-            """ if product_mask.any():
-                with torch.no_grad():
-                    logits = outputs["logits"]
-                    predictions = torch.argmax(logits, dim=-1)
-                    acc_metrics = calculate_accuracy(predictions, x_target, product_mask, model.config.pad_token_id)
-                    train_token_acc += acc_metrics["token_accuracy"]
-                    train_seq_acc += acc_metrics["sequence_accuracy"] """
-            if product_mask.any():
-                with torch.no_grad():
-                    logits = outputs["logits"]
-                    predictions = torch.argmax(logits, dim=-1)
-                    
-                    # Use the fixed accuracy calculation that considers what was actually masked
-                    acc_metrics = calculate_accuracy_fixed(
-                        predictions, x_target, product_mask, 
-                        model.config.pad_token_id, x_noisy, model.config.mask_token_id
-                    )
-                    train_token_acc += acc_metrics["token_accuracy"]
-                    train_seq_acc += acc_metrics["sequence_accuracy"]
             
             # Backward pass
             optimizer.zero_grad()
@@ -1234,12 +1272,19 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
                 avg_token_acc = train_token_acc / num_successful_batches
                 avg_seq_acc = train_seq_acc / num_successful_batches
                 
-                pbar_train.set_postfix({
+                postfix_dict = {
                     "loss": f"{avg_train_loss:.4f}",
                     "tok_acc": f"{avg_token_acc:.3f}",
                     "seq_acc": f"{avg_seq_acc:.3f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}"
-                })
+                }
+                
+                # Add ELBO-specific metrics if available
+                if use_elbo_loss and num_successful_batches > 0:
+                    avg_importance_weight = total_importance_weight / num_successful_batches
+                    postfix_dict["iw"] = f"{avg_importance_weight:.2f}"
+                
+                pbar_train.set_postfix(postfix_dict)
         
         pbar_train.close()
         
@@ -1259,34 +1304,6 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
             train_seq_acc=avg_train_seq_acc,
             learning_rate=scheduler.get_last_lr()[0]
         )
-
-        # Add debugging for performance
-        if batch_idx % 100 == 0 and product_mask.any():  # Debug every 100 batches
-            with torch.no_grad():
-                # Check first sample in batch
-                first_target = x_target[0]
-                first_noisy = x_noisy[0] 
-                first_product_mask = product_mask[0]
-                first_predictions = torch.argmax(outputs["logits"][0], dim=-1)
-                
-                # Count what was actually masked 
-                actually_masked = (first_noisy == model.config.mask_token_id) & first_product_mask
-                total_product_tokens = first_product_mask.sum().item()
-                masked_tokens = actually_masked.sum().item()
-                
-                print(f"\n    DEBUG Batch {batch_idx}:")
-                print(f"      Product tokens total: {total_product_tokens}")
-                print(f"      Actually masked: {masked_tokens}")
-                print(f"      Masking ratio: {masked_tokens/max(total_product_tokens,1):.2f}")
-                
-                # Show actual sequences
-                target_str = tokenizer.decode(first_target.tolist())
-                noisy_str = tokenizer.decode(first_noisy.tolist())
-                pred_str = tokenizer.decode(first_predictions.tolist())
-                
-                print(f"      Target: {target_str}")
-                print(f"      Noisy:  {noisy_str}")  
-                print(f"      Pred:   {pred_str}")
         
         # Validation phase
         if (epoch + 1) % validation_freq == 0:
@@ -1295,6 +1312,7 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
             val_token_acc = 0
             val_seq_acc = 0
             num_val_batches = 0
+            val_importance_weight = 0
             
             pbar_val = tqdm(
                 val_dataloader, 
@@ -1306,35 +1324,52 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
             
             with torch.no_grad():
                 for batch in pbar_val:
-                    x_masked = batch['x_masked'].to(device)
                     x_target = batch['x_target'].to(device)
                     product_mask = batch['product_mask'].to(device)
                     
-                    batch_size_curr = x_masked.shape[0]
+                    batch_size_curr = x_target.shape[0]
                     
-                    # Sample random time steps for validation
-                    t = torch.rand(batch_size_curr, device=device)
-                    
-                    # Forward diffusion
-                    x_noisy = model.forward_sample(x_target, t, product_mask)
-                    
-                    # Forward pass
-                    outputs = model(x_noisy, t, x_target, product_mask)
-                    loss = outputs.get('loss', torch.tensor(0.0, device=device))
-                    
-                    # Calculate accuracy
-                    """ if product_mask.any():
-                        logits = outputs["logits"]
-                        predictions = torch.argmax(logits, dim=-1)
-                        acc_metrics = calculate_accuracy(predictions, x_target, product_mask, model.config.pad_token_id)
-                        val_token_acc += acc_metrics["token_accuracy"]
-                        val_seq_acc += acc_metrics["sequence_accuracy"] """
-                    if product_mask.any():
-                        with torch.no_grad():
+                    if use_elbo_loss and hasattr(model, 'elbo_loss'):
+                        # Use ELBO loss for validation
+                        elbo_results = model.elbo_loss.compute_elbo_loss(
+                            model=model,
+                            x_target=x_target,
+                            product_mask=product_mask,
+                            use_importance_sampling=True
+                        )
+                        
+                        loss = elbo_results["loss"]
+                        
+                        if elbo_results["num_masked_tokens"] > 0:
+                            val_importance_weight += elbo_results["mean_importance_weight"]
+                        
+                        # Calculate accuracy metrics
+                        if product_mask.any():
+                            t = torch.rand(batch_size_curr, device=device)
+                            x_noisy = model.forward_sample(x_target, t, product_mask)
+                            outputs = model(x_noisy, t)
                             logits = outputs["logits"]
                             predictions = torch.argmax(logits, dim=-1)
                             
-                            # Use the fixed accuracy calculation
+                            acc_metrics = calculate_accuracy_fixed(
+                                predictions, x_target, product_mask, 
+                                model.config.pad_token_id, x_noisy, model.config.mask_token_id
+                            )
+                            val_token_acc += acc_metrics["token_accuracy"]
+                            val_seq_acc += acc_metrics["sequence_accuracy"]
+                    
+                    else:
+                        # Original validation logic
+                        t = torch.rand(batch_size_curr, device=device)
+                        x_noisy = model.forward_sample(x_target, t, product_mask)
+                        
+                        outputs = model(x_noisy, t, x_target, product_mask, use_elbo_loss=False)
+                        loss = outputs.get('loss', torch.tensor(0.0, device=device))
+                        
+                        if product_mask.any():
+                            logits = outputs["logits"]
+                            predictions = torch.argmax(logits, dim=-1)
+                            
                             acc_metrics = calculate_accuracy_fixed(
                                 predictions, x_target, product_mask, 
                                 model.config.pad_token_id, x_noisy, model.config.mask_token_id
@@ -1351,11 +1386,17 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
                         avg_val_token_acc = val_token_acc / num_val_batches
                         avg_val_seq_acc = val_seq_acc / num_val_batches
                         
-                        pbar_val.set_postfix({
+                        postfix_dict = {
                             "loss": f"{avg_val_loss:.4f}",
                             "tok_acc": f"{avg_val_token_acc:.3f}",
                             "seq_acc": f"{avg_val_seq_acc:.3f}"
-                        })
+                        }
+                        
+                        if use_elbo_loss and num_val_batches > 0:
+                            avg_val_iw = val_importance_weight / num_val_batches
+                            postfix_dict["iw"] = f"{avg_val_iw:.2f}"
+                        
+                        pbar_val.set_postfix(postfix_dict)
             
             pbar_val.close()
             
@@ -1369,6 +1410,12 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
             print(f"\n EPOCH {epoch+1} SUMMARY:")
             print(f"Training: Loss: {avg_train_loss:.4f} | Token Acc: {avg_train_token_acc:.3f} | Seq Acc: {avg_train_seq_acc:.3f}")
             print(f"Validation: Loss: {epoch_metrics.val_loss:.4f} | Token Acc: {epoch_metrics.val_token_acc:.3f} | Seq Acc: {epoch_metrics.val_seq_acc:.3f}")
+            
+            if use_elbo_loss and num_successful_batches > 0:
+                avg_train_iw = total_importance_weight / num_successful_batches
+                avg_val_iw = val_importance_weight / num_val_batches if num_val_batches > 0 else 0
+                print(f"Importance Weights - Train: {avg_train_iw:.2f} | Val: {avg_val_iw:.2f}")
+            
             print(f"LR: {scheduler.get_last_lr()[0]:.2e}")
             
             # Check for best model
@@ -1384,19 +1431,16 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
                     'scheduler_state_dict': scheduler.state_dict(),
                     'config': model.config,
                     'val_loss': best_val_loss,
-                    'metrics_history': metrics_tracker.metrics_history
-                }, os.path.join(save_dir, 'best_model.pt'))
+                    'metrics_history': metrics_tracker.metrics_history,
+                    'use_elbo_loss': use_elbo_loss
+                }, os.path.join(save_dir, 'best_model_elbo.pt'))
             
-            # Generate examples and store them
+            # Generate examples
             print(f"\n Generated examples:")
             gen_results = enhanced_generate_examples_during_training(
                 model, val_dataset, tokenizer, metrics_tracker, epoch + 1, 
                 example_sampler, examples_per_epoch
             )
-        else:
-            print(f"\n EPOCH {epoch+1} SUMMARY:")
-            print(f"Train: Loss: {avg_train_loss:.4f} | Token Acc: {avg_train_token_acc:.3f} | Seq Acc: {avg_train_seq_acc:.3f}")
-            print(f"LR: {scheduler.get_last_lr()[0]:.2e}")
         
         # Add metrics to tracker
         metrics_tracker.add_metrics(epoch_metrics)
@@ -1414,6 +1458,7 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
     
     print(f"\n TRAINING COMPLETED!")
     print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Loss type used: {'ELBO' if use_elbo_loss else 'Standard'}")
     
     # Final saves
     metrics_tracker.save_metrics_json()
@@ -1424,134 +1469,3 @@ def train_reaction_md4_enhanced(model, train_dataset, val_dataset, tokenizer,
     metrics_tracker.plot_metrics(os.path.join(save_dir, "final_training_metrics.png"))
     
     return metrics_tracker
-
-
-# Example usage and main training script
-if __name__ == "__main__":
-    
-    # Load your data
-    print("Loading reaction data...")
-    with open("/home/gpwuq/ipms-foundation_model/data/interim/clean_corpus_only_reactions.txt") as f:
-        reactions = [line.strip() for line in f if line.strip()]
-    
-    print(f"Loaded {len(reactions)} reactions")
-    
-    # Initialize tokenizer
-    tokenizer = CustomTokenizer("/home/gpwuq/ipms-foundation_model/data/interim/clean_vocab_only_reactions_smiles_combined.json")
-    
-    # Configuration
-    config = ReactionMD4Config(
-        vocab_size=len(tokenizer.vocab),
-        max_seq_length=230,
-        d_model=512,
-        n_layers=6,
-        n_heads=8,
-        d_ff=2048,
-        dropout=0.1,
-        max_product_tokens=82,
-        reactant_sep_token_id=25,
-        pad_token_id=0,
-        eos_token_id=tokenizer.eos_token_id,
-        noagent_token_id=tokenizer.noagent_token_id,
-        noise_schedule="cosine",
-        timesteps=1000
-    )
-    
-    print(f"\nUsing configuration:")
-    print(f"  max_seq_length: {config.max_seq_length}")
-    print(f"  max_product_tokens: {config.max_product_tokens}")
-    print(f"  vocab_size: {config.vocab_size}")
-    print(f"  noise_schedule: {config.noise_schedule}")
-    
-    # Shuffle and split data
-    random.shuffle(reactions)
-    
-    train_size = int(0.8 * len(reactions))
-    val_size = int(0.1 * len(reactions))
-    
-    train_data = reactions[:train_size]
-    val_data = reactions[train_size:train_size+val_size]
-    test_data = reactions[train_size+val_size:]
-    
-    print(f"\nData split:")
-    print(f"  Train: {len(train_data):,} samples")
-    print(f"  Val: {len(val_data):,} samples") 
-    print(f"  Test: {len(test_data):,} samples")
-    
-    # Initialize model
-    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    model = ReactionMD4(config).to(device)
-    
-    # Create datasets
-    train_dataset = ReactionDataset(train_data, tokenizer, config)
-    val_dataset = ReactionDataset(val_data, tokenizer, config)
-    test_dataset = ReactionDataset(test_data, tokenizer, config)
-    
-    examples_per_epoch = 75
-    num_epochs = 10
-    
-    print(f"\nTraining configuration:")
-    print(f"  Examples per epoch: {examples_per_epoch}")
-    print(f"  Total examples over training: ~{examples_per_epoch * num_epochs}")
-    print(f"  Storage strategy: Systematic sampling with rotation")
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    print(f"\nModel initialized:")
-    print(f"  Total parameters: {total_params:,}")
-    print(f"  Trainable parameters: {trainable_params:,}")
-    print(f"  Model size: ~{total_params * 4 / 1024**2:.1f} MB")
-    
-    # Training
-    print(f"\nStarting training...")
-    
-    # Enhanced training with metrics tracking
-    metrics_tracker = train_reaction_md4_enhanced(
-        model=model,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        tokenizer=tokenizer,
-        num_epochs=20,
-        batch_size=32,
-        learning_rate=1e-4,
-        validation_freq=1,
-        save_dir="training_logs_basic_diffusion_model8_with_tracking",
-        examples_per_epoch=examples_per_epoch
-    )
-    
-    print("\n Training complete! Check 'training_logs' directory for:")
-    print("  - training_metrics_*.png: Comprehensive plots")
-    print("  - metrics_*.json: Raw metrics data")
-    print("  - generated_examples_*.json: Generated examples")
-    print("  - best_model.pt: Best model checkpoint")
-    
-    # Final test evaluation
-    print("\n" + "="*80)
-    print("RUNNING FINAL TEST EVALUATION")
-    print("="*80)
-    
-    test_results = test_model(
-        model=model,
-        test_dataset=test_dataset,
-        tokenizer=tokenizer,
-        batch_size=32,
-        num_steps=100
-    )
-    
-    print(f"\n TRAINING COMPLETED!")
-    print(f"Final test token accuracy: {test_results['token_accuracy']:.4f}")
-    print(f"Final test sequence accuracy: {test_results['sequence_accuracy']:.4f}")
-    
-    # Optional: Save the trained model
-    # torch.save({
-    #     'model_state_dict': model.state_dict(),
-    #     'config': config,
-    #     'test_results': test_results
-    # }, 'reaction_md4.pt')
-    # print("Model saved as 'reaction_md4.pt'")
-
-    metrics_tracker.plot_metrics(save_path="final_metrics_fixed_ACC.png")
-    metrics_tracker.plot_individual_metrics(save_dir="individual_plots_fixed_ACC")
