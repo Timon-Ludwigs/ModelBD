@@ -21,7 +21,7 @@ from loss_function.loss_implementations import ELBOLoss
 class ReactionMD4Config:
     """Configuration for Reaction Product Generation MD4."""
     vocab_size: int = 1447  
-    max_seq_length: int = 230 
+    max_seq_length: int = 350 # 230 before 
     d_model: int = 512
     n_layers: int = 6
     n_heads: int = 8
@@ -32,7 +32,7 @@ class ReactionMD4Config:
     pad_token_id: int = 0
     eos_token_id: int = 3
     noagent_token_id: int = 5
-    max_product_tokens: int = 82
+    max_product_tokens: int = 200 # 82 before
     noise_schedule: str = "cosine"  # "linear", "cosine", "geometric"
     timesteps: int = 1000
     use_elbo_loss: bool = True  # Flag to use ELBO loss
@@ -218,6 +218,37 @@ class TimeEmbedding(nn.Module):
         emb = torch.cat([emb.sin(), emb.cos()], dim=-1) # shape: (batch, half_dim)
         
         return self.mlp(emb)
+    
+class TransformerBlockNoTime(nn.Module):
+    """Transformer block without time conditioning."""
+    def __init__(self, config):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.d_model)
+        self.attn = nn.MultiheadAttention(
+            config.d_model, config.n_heads, dropout=config.dropout,
+            batch_first=True
+        )
+        self.ln2 = nn.LayerNorm(config.d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(config.d_model, config.d_ff),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_ff, config.d_model),
+            nn.Dropout(config.dropout)
+        )
+    
+    def forward(self, x):  # No time_emb parameter
+        # Self-attention
+        x_norm = self.ln1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = x + attn_out
+        
+        # MLP without time conditioning
+        x_norm = self.ln2(x)
+        mlp_out = self.mlp(x_norm)
+        x = x + mlp_out
+        
+        return x
 
 
 class TransformerBlock(nn.Module):
@@ -274,8 +305,8 @@ class ReactionMD4(nn.Module):
         self.config = config
         
         # Token embeddings (including mask token)
-        # Each token ID is mapped to a d_model-dimensional embedding (+1 because mask_token_id is included in the embedding table)
-        self.token_embedding = nn.Embedding(config.vocab_size + 1, config.d_model)
+        # Each token ID is mapped to a d_model-dimensional embedding (No need for +1 because mask_token_id is included in the embedding table)
+        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         
         # Position encoding
         # Add sinusoidal positional encodings to token embeddings
@@ -283,11 +314,15 @@ class ReactionMD4(nn.Module):
         
         # Time embedding
         # Converts diffusion timestep t into a d_model-dimensional embedding
-        self.time_embedding = TimeEmbedding(config.d_model)
+        #self.time_embedding = TimeEmbedding(config.d_model)
         
         # Transformer backbone
-        self.layers = nn.ModuleList([
+        """ self.layers = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.n_layers)
+        ]) """
+
+        self.layers = nn.ModuleList([
+            TransformerBlockNoTime(config) for _ in range(config.n_layers)
         ])
         
         self.ln_f = nn.LayerNorm(config.d_model)
@@ -379,11 +414,15 @@ class ReactionMD4(nn.Module):
         x = self.dropout(x)
         
         # Time embedding
-        time_emb = self.time_embedding(t)  # [batch, d_model]
+        # time_emb = self.time_embedding(t)  # [batch, d_model]
         
         # Apply transformer layers and map to vocab logits
+        """ for layer in self.layers:
+            x = layer(x, time_emb) """
+
+        # Apply transformer layers without time
         for layer in self.layers:
-            x = layer(x, time_emb)
+            x = layer(x)  # No time_emb argument
         
         x = self.ln_f(x)
         
@@ -1045,6 +1084,9 @@ def enhanced_generate_examples_during_training(model, val_dataset, tokenizer,
         model, val_dataset, tokenizer, metrics_tracker, epoch, 
         example_sampler, num_examples
     )
+
+    if generated_examples:
+        metrics_tracker.add_generated_examples(epoch, generated_examples)
     
     # Calculate actual generation accuracy on a separate set of samples
     print(f"\n CALCULATING TRUE GENERATION ACCURACY...")
@@ -1055,7 +1097,13 @@ def enhanced_generate_examples_during_training(model, val_dataset, tokenizer,
     print(f"      TRUE Generation Accuracy: {gen_results['generation_accuracy']:.3f}")
     print(f"      Correct: {gen_results['correct_samples']}/{gen_results['total_samples']}")
     
-    return gen_results
+    # return results and examples
+    return {
+        "generation_accuracy": gen_results["generation_accuracy"],
+        "correct_samples": gen_results["correct_samples"],
+        "total_samples": gen_results["total_samples"],
+        "generated_examples": generated_examples
+    }
 
 def truncate_at_eos(sequence_str: str, tokenizer) -> str:
     """Truncate a decoded sequence at the first EOS token."""
@@ -1134,7 +1182,7 @@ def generate_examples_during_training_enhanced(model, dataset, tokenizer,
                 if i < 3:
                     reactants_agents_text = f"{reactants}>{agents}>" if agents else f"{reactants}>>"
                     best_match = max(generated_variants, key=lambda x: x["is_correct"])
-                    match_indicator = "✓" if best_match["is_correct"] else "✗"
+                    match_indicator = "Correct" if best_match["is_correct"] else "Not correct"
                     
                     print(f"      {i+1}. {reactants_agents_text}")
                     print(f"         True:      {true_product}")
@@ -1144,6 +1192,8 @@ def generate_examples_during_training_enhanced(model, dataset, tokenizer,
                         
             except Exception as e:
                 print(f"      Error generating example {i+1}: {str(e)}")
+
+    return generated_examples
         
 def train_reaction_md4_with_elbo(model, train_dataset, val_dataset, tokenizer,
                                num_epochs: int = 10, batch_size: int = 32,
