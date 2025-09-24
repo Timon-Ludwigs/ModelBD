@@ -1,0 +1,310 @@
+from tqdm import tqdm
+import re
+import json
+from collections import Counter
+from rdkit import Chem
+from rdkit.Chem import rdMolDescriptors
+
+class AtomInSMILESTokenizer:
+    def __init__(self):
+        # Special tokens remain the same
+        self.special_tokens = {
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "[NOAGENT]", "[EOS]"
+        }
+        
+        # Initialize empty vocab and lookup dictionaries
+        self.vocab = {}
+        self.token_to_id = {}
+        self.id_to_token = {}
+        
+        # Pattern for non-SMILES tokens (reactions separators, etc.)
+        self.non_smiles_pattern = re.compile(r'(>>|>)')
+
+    def atom_to_smiles_tokenize(self, smiles):
+        """
+        Implement the Atom-in-SMILES tokenization algorithm.
+        Each atom becomes a token with its structural context.
+        """
+        # Handle special cases and separators first
+        if smiles in self.special_tokens:
+            return [smiles]
+        
+        # Handle reaction arrows
+        if '>>' in smiles or '>' in smiles:
+            parts = self.non_smiles_pattern.split(smiles)
+            tokens = []
+            for part in parts:
+                if part in ['>', '>>']:
+                    tokens.append(part)
+                elif part:
+                    tokens.extend(self.atom_to_smiles_tokenize(part))
+            return tokens
+        
+        # Try to parse as SMILES molecule
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                # Fallback to character-level tokenization if RDKit fails
+                return list(smiles)
+            
+            # Get atom mapping to original SMILES positions (approximate)
+            tokens = []
+            
+            # Get ring information
+            ring_info = mol.GetRingInfo()
+            atom_rings = {}
+            for ring_idx, ring in enumerate(ring_info.AtomRings()):
+                for atom_idx in ring:
+                    if atom_idx not in atom_rings:
+                        atom_rings[atom_idx] = []
+                    atom_rings[atom_idx].append(ring_idx)
+            
+            # Process each atom
+            for atom in mol.GetAtoms():
+                atom_idx = atom.GetIdx()
+                symbol = atom.GetSymbol()
+                
+                # Get formal charge
+                charge = atom.GetFormalCharge()
+                
+                # Get aromaticity
+                is_aromatic = atom.GetIsAromatic()
+                
+                # Check if in ring
+                in_ring = atom_idx in atom_rings
+                
+                # Get number of neighbors (degree)
+                neighbors = len([n for n in atom.GetNeighbors()])
+                
+                # Create atom token with context
+                atom_token = f"[{symbol}"
+                
+                # Add charge if non-zero
+                if charge != 0:
+                    if charge > 0:
+                        atom_token += f";+{charge}"
+                    else:
+                        atom_token += f";{charge}"
+                
+                # Add aromaticity info
+                if is_aromatic:
+                    atom_token += ";Arom"
+                
+                # Add ring info
+                if in_ring:
+                    atom_token += ";Ring"
+                else:
+                    atom_token += ";Chain"
+                
+                # Add neighbor count
+                atom_token += f";Neighb{neighbors}"
+                
+                atom_token += "]"
+                tokens.append(atom_token)
+            
+            return tokens
+            
+        except Exception as e:
+            # Fallback to character-level if anything fails
+            print(f"Warning: Failed to parse '{smiles}' with RDKit: {e}")
+            return list(smiles)
+
+    def tokenize_smiles(self, smiles):
+        """Tokenize using Atom-in-SMILES approach."""
+        return self.atom_to_smiles_tokenize(smiles)
+
+    def tokenize(self, line):
+        """Tokenize an entire line of input text."""
+        tokens = []
+        # Split by whitespace
+        parts = line.strip().split()
+        for part in parts:
+            if part in self.special_tokens:
+                # Directly add special tokens
+                tokens.append(part)
+            elif part.startswith("[") and "]" in part and part in self.special_tokens:
+                tokens.append(part)
+            else:
+                # Tokenize using Atom-in-SMILES
+                tokens.extend(self.tokenize_smiles(part))
+        return tokens
+
+    def build_vocab(self, corpus_lines, min_freq=1):
+        """Build vocabulary from corpus lines."""
+        counter = Counter()
+        
+        print("Tokenizing corpus with Atom-in-SMILES...")
+        for line in tqdm(corpus_lines, desc="Processing lines"):
+            tokens = self.tokenize(line)
+            counter.update(tokens)
+
+        # Keep only tokens with frequency above min_freq, sort alphabetically
+        sorted_tokens = sorted([tok for tok, freq in counter.items() if freq >= min_freq])
+
+        # Compose the final vocabulary
+        vocab = ["[PAD]", "[UNK]"] + list(self.special_tokens - {"[PAD]", "[UNK]"}) + sorted_tokens
+        
+        # Create token-to-id and id-to-token mappings
+        self.vocab = vocab
+        self.token_to_id = {tok: i for i, tok in enumerate(vocab)}
+        self.id_to_token = {i: tok for tok, i in self.token_to_id.items()}
+        
+        print(f"Built vocabulary with {len(vocab)} tokens")
+        print(f"Special tokens: {len(self.special_tokens)}")
+        print(f"Chemical tokens: {len(sorted_tokens)}")
+
+    def encode(self, text):
+        """Convert text to token IDs."""
+        tokens = self.tokenize(text)
+        return [self.token_to_id.get(tok, self.token_to_id["[UNK]"]) for tok in tokens]
+
+    def decode(self, token_ids):
+        """Convert token IDs back to text."""
+        tokens = [self.id_to_token.get(i, "[UNK]") for i in token_ids]
+        # For Atom-in-SMILES, we need to reconstruct the SMILES
+        # This is a simplified version - might need refinement
+        result = ""
+        for token in tokens:
+            if token.startswith("[") and token.endswith("]") and ";" in token:
+                # Extract just the atom symbol from atom token
+                symbol = token.split(";")[0][1:]  # Remove [ and get symbol
+                result += symbol
+            else:
+                result += token
+        return result
+
+    def save_vocab(self, path):
+        """Save vocabulary to JSON file."""
+        with open(path, "w") as f:
+            json.dump(self.token_to_id, f, indent=2)
+
+    def load_vocab(self, path):
+        """Load vocabulary from JSON file."""
+        with open(path, "r") as f:
+            self.token_to_id = json.load(f)
+        self.id_to_token = {i: tok for tok, i in self.token_to_id.items()}
+        self.vocab = list(self.token_to_id.keys())
+
+
+class CustomAtomInSMILESTokenizer:
+    """Custom tokenizer that loads Atom-in-SMILES vocabulary."""
+    
+    def __init__(self, vocab_path: str):
+        with open(vocab_path, "r") as f:
+            self.token_to_id = json.load(f)
+
+        self.id_to_token = {v: k for k, v in self.token_to_id.items()}
+        self.vocab = set(self.token_to_id.keys())
+
+        # Required special tokens
+        self.pad_token = "[PAD]"
+        self.mask_token = "[MASK]"
+        self.unk_token = "[UNK]"
+        self.eos_token = "[EOS]"
+        self.noagent_token = "[NOAGENT]"
+
+        # IDs for special tokens
+        self.pad_token_id = self._require_token(self.pad_token)
+        self.mask_token_id = self._require_token(self.mask_token)
+        self.unk_token_id = self._require_token(self.unk_token)
+        self.eos_token_id = self._require_token(self.eos_token)
+        self.noagent_token_id = self._require_token(self.noagent_token)
+
+    def _require_token(self, token):
+        tid = self.token_to_id.get(token, None)
+        if tid is None:
+            raise ValueError(f"{token} token is missing in vocabulary!")
+        return tid
+
+    @property
+    def vocab_size(self):
+        """Number of tokens in vocab (includes [MASK])"""
+        return len(self.token_to_id)
+
+    def get_special_token_id(self, token):
+        return self.token_to_id.get(token, self.unk_token_id)
+
+    def encode(self, text: str) -> list:
+        """Encode text using Atom-in-SMILES tokenization."""
+        # This is a simplified version - you might want to use the full tokenizer
+        # For now, we'll do greedy matching
+        pieces = text.strip().split()
+        tokens = []
+        for piece in pieces:
+            tokens.extend(self._atom_aware_tokenize(piece))
+        return [self.token_to_id.get(token, self.unk_token_id) for token in tokens]
+
+    def decode(self, token_ids: list) -> str:
+        """Decode token IDs back to SMILES string."""
+        result = ""
+        for i in token_ids:
+            if i == self.pad_token_id:
+                continue
+            
+            token = self.id_to_token[i]
+            
+            # Handle atom tokens - extract just the symbol
+            if token.startswith("[") and ";" in token and token.endswith("]"):
+                # Extract atom symbol from [Symbol;...;...] format
+                symbol = token.split(";")[0][1:]  # Remove [ and get symbol
+                result += symbol
+            else:
+                result += token
+        
+        return result
+
+    def _atom_aware_tokenize(self, text: str) -> list:
+        """Simple atom-aware tokenization - fallback method."""
+        # This is a simplified version for when we don't have RDKit available
+        # In practice, you'd want to use the full AtomInSMILESTokenizer logic
+        i = 0
+        tokens = []
+        while i < len(text):
+            # Look for atom tokens in vocabulary first
+            match = None
+            for j in range(len(text), i, -1):
+                sub = text[i:j]
+                if sub in self.vocab:
+                    match = sub
+                    break
+            
+            if match:
+                tokens.append(match)
+                i += len(match)
+            else:
+                # Try to find longest matching atom token
+                found = False
+                for token in self.vocab:
+                    if (token.startswith("[") and ";" in token and 
+                        token.endswith("]") and text[i:].startswith(token.split(";")[0][1:])):
+                        tokens.append(token)
+                        symbol_len = len(token.split(";")[0][1:])
+                        i += symbol_len
+                        found = True
+                        break
+                
+                if not found:
+                    tokens.append(self.unk_token)
+                    i += 1
+                    
+        return tokens
+
+
+# Example usage for building vocabulary
+if __name__ == "__main__":
+    # Create the tokenizer
+    tokenizer = AtomInSMILESTokenizer()
+    
+    # Test on a few examples first
+    test_smiles = ["CCO", "c1ccccc1", "CC(=O)O", "C[N+](C)(C)C"]
+    for smiles in test_smiles:
+        tokens = tokenizer.tokenize_smiles(smiles)
+        print(f"{smiles} -> {tokens}")
+    
+    # Load your corpus and build vocabulary
+    # clean_corpus = "/path/to/your/clean_corpus4.txt"
+    # with open(clean_corpus) as f:
+    #     lines = f.readlines()
+    # 
+    # tokenizer.build_vocab(lines, min_freq=1)
+    # tokenizer.save_vocab("/path/to/atom_in_smiles_vocab.json")
