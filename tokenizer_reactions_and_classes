@@ -1,0 +1,170 @@
+from tqdm import tqdm
+import re
+import json
+from collections import Counter
+
+class ReactionClassVocabBuilder:
+    def __init__(self):
+        # Regular expression to tokenize SMILES strings into atoms and chemical symbols
+        self.SMILES_REGEX = r"(>>|\[[^\[\]]{1,10}\]|Br|Cl|Si|Se|Na|Ca|Li|Mg|Zn|Cu|Fe|Mn|Hg|Ag|Au|[B-IK-Zb-ik-z0-9=#$%@+\->\(\)/\\\.])"
+        
+        # Regular expression to match reaction classes (e.g., 2.12.13, 1.5.2, etc.)
+        self.REACTION_CLASS_REGEX = r"^\d+(\.\d+)*$"
+        
+        # Compile the regular expression patterns for faster performance
+        self.smiles_pattern = re.compile(self.SMILES_REGEX)
+        self.reaction_class_pattern = re.compile(self.REACTION_CLASS_REGEX)
+
+        # Define base special tokens
+        self.special_tokens = {
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "[NOAGENT]", "[EOS]"
+        }
+
+        # Initialize vocab dictionaries
+        self.vocab = []
+        self.token_to_id = {}
+        self.id_to_token = {}
+
+    def tokenize_smiles(self, smiles):
+        """Tokenizes a SMILES string into atomic/chemical tokens"""
+        return self.smiles_pattern.findall(smiles)
+
+    def is_reaction_class(self, text):
+        """Check if a string is a reaction class like 2.12.13"""
+        return bool(self.reaction_class_pattern.match(text))
+
+    def extract_tokens_from_line(self, line):
+        """Extract all tokens from a line with format: REACTION_SMILES REACTION_CLASS"""
+        tokens = set()
+        parts = line.strip().split()
+        
+        if len(parts) == 0:
+            return tokens
+        
+        # First part is the reaction SMILES
+        reaction_smiles = parts[0]
+        
+        # Extract SMILES tokens
+        smiles_tokens = self.tokenize_smiles(reaction_smiles)
+        tokens.update(smiles_tokens)
+        
+        # Process remaining parts (should be reaction class)
+        for part in parts[1:]:
+            if self.is_reaction_class(part):
+                # Add both the raw reaction class AND the bracketed format
+                tokens.add(part)  # e.g., "2.12.3"
+                # Also add the format used by preprocessing
+                class_token = f"[CLS:{part.replace('.', '_')}]"  # e.g., "[CLS:2_12_3]"
+                tokens.add(class_token)
+            else:
+                # If it's not a reaction class, tokenize as SMILES
+                tokens.update(self.tokenize_smiles(part))
+        
+        return tokens
+
+    def build_vocab(self, corpus_lines, min_freq=1):
+        """Build vocabulary from corpus lines"""
+        print("Extracting tokens from corpus...")
+        counter = Counter()
+        
+        for line in tqdm(corpus_lines, desc="Processing lines"):
+            tokens = self.extract_tokens_from_line(line)
+            counter.update(tokens)
+        
+        # Filter by minimum frequency and separate token types
+        regular_tokens = []
+        reaction_classes = []
+        
+        for token, freq in counter.items():
+            if freq >= min_freq:
+                if self.is_reaction_class(token):
+                    reaction_classes.append(token)
+                else:
+                    regular_tokens.append(token)
+        
+        # Sort tokens
+        regular_tokens.sort()
+        reaction_classes.sort()
+        
+        # Build final vocabulary: special tokens first, then regular tokens, then reaction classes
+        self.vocab = (["[PAD]", "[UNK]"] + 
+                     list(self.special_tokens - {"[PAD]", "[UNK]"}) + 
+                     regular_tokens + 
+                     reaction_classes)
+        
+        # Create mappings
+        self.token_to_id = {token: i for i, token in enumerate(self.vocab)}
+        self.id_to_token = {i: token for token, i in self.token_to_id.items()}
+        
+        print(f"\nVocabulary Statistics:")
+        print(f"Total vocabulary size: {len(self.vocab)}")
+        print(f"Special tokens: {len(self.special_tokens)}")
+        print(f"Regular SMILES tokens: {len(regular_tokens)}")
+        print(f"Reaction classes: {len(reaction_classes)}")
+        print(f"Tokens with frequency >= {min_freq}: {len(regular_tokens) + len(reaction_classes)}")
+        
+        if reaction_classes:
+            print(f"\nFirst 10 reaction classes: {reaction_classes[:10]}")
+        
+        return self.vocab
+
+    def save_vocab(self, path):
+        """Save vocabulary to JSON file"""
+        vocab_data = {
+            'token_to_id': self.token_to_id,
+            'vocab_size': len(self.vocab),
+            'special_tokens': list(self.special_tokens)
+        }
+        
+        with open(path, "w") as f:
+            json.dump(vocab_data, f, indent=2)
+        
+        print(f"Vocabulary saved to {path}")
+
+    def load_vocab(self, path):
+        """Load vocabulary from JSON file"""
+        with open(path, "r") as f:
+            vocab_data = json.load(f)
+        
+        self.token_to_id = vocab_data['token_to_id']
+        self.id_to_token = {int(i): token for token, i in self.token_to_id.items()}
+        self.vocab = list(self.token_to_id.keys())
+        
+        print(f"Vocabulary loaded from {path}")
+        print(f"Vocabulary size: {len(self.vocab)}")
+
+
+# Example usage
+if __name__ == "__main__":
+    # Create the vocabulary builder
+    vocab_builder = ReactionClassVocabBuilder()
+    
+    # Test with example data
+    test_lines = [
+        "CCO>NaOH>CCCBr 2.12.13",
+        "CCO>>CCCBr 1.5.2", 
+        "C[N+](C)(C)C.Cl>K2CO3>CCCN 3.1.1",
+        "CCO>>CCCO 2.12.13",
+        "CC(=O)OC>H2O>CC(=O)O 1.2.4"
+    ]
+    
+    print("Test tokenization:")
+    for line in test_lines:
+        tokens = vocab_builder.extract_tokens_from_line(line)
+        print(f"Line: {line}")
+        print(f"Tokens: {sorted(tokens)}")
+        print()
+    
+    # Build vocabulary from test data
+    vocab = vocab_builder.build_vocab(test_lines, min_freq=1)
+
+    # Load your actual corpus
+    corpus_file = "/home/gpwuq/ipms-foundation_model/data/interim/clean_corpus_reactions_and_classes.txt"
+    with open(corpus_file, 'r') as f:
+        lines = f.readlines()
+    
+    # Build vocabulary
+    vocab_builder.build_vocab(lines, min_freq=1)
+    
+    # Save vocabulary
+    vocab_builder.save_vocab("/home/gpwuq/ipms-foundation_model/data/interim/clean_vocab_reactions_and_classes.json")
