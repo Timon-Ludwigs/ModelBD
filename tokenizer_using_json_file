@@ -1,0 +1,70 @@
+import json
+
+class CustomTokenizer:
+    def __init__(self, vocab_path: str):
+        with open(vocab_path, "r") as f:
+            self.token_to_id = json.load(f)
+
+        self.id_to_token = {v: k for k, v in self.token_to_id.items()}
+        self.vocab = set(self.token_to_id.keys())
+
+        # Required special tokens
+        self.pad_token = "[PAD]"
+        self.mask_token = "[MASK]"
+        self.unk_token = "[UNK]"
+        self.eos_token = "[EOS]"
+        self.noagent_token = "[NOAGENT]"
+
+        # IDs for special tokens
+        self.pad_token_id = self._require_token(self.pad_token)
+        self.mask_token_id = self._require_token(self.mask_token)
+        self.unk_token_id = self._require_token(self.unk_token)
+        self.eos_token_id = self._require_token(self.eos_token)
+        self.noagent_token_id = self._require_token(self.noagent_token)
+
+    def _require_token(self, token):
+        tid = self.token_to_id.get(token, None)
+        if tid is None:
+            raise ValueError(f"{token} token is missing in vocabulary!")
+        return tid
+
+    @property
+    def vocab_size(self):
+        """Number of tokens in vocab (includes [MASK])"""
+        return len(self.token_to_id)
+
+    def get_special_token_id(self, token):
+        return self.token_to_id.get(token, self.unk_token_id)
+
+    def encode(self, text: str) -> list:
+        """Greedy tokenization for SMILES strings."""
+        pieces = text.strip().split()
+        tokens = []
+        for piece in pieces:
+            tokens.extend(self._greedy_tokenize(piece))
+        return [self.token_to_id.get(token, self.unk_token_id) for token in tokens]
+
+    def decode(self, token_ids: list) -> str:
+        """Join tokens into a string, skipping PAD tokens."""
+        return ''.join(
+            self.id_to_token[i] for i in token_ids
+            if i != self.pad_token_id
+        )
+
+    def _greedy_tokenize(self, text: str) -> list:
+        i = 0
+        tokens = []
+        while i < len(text):
+            match = None
+            for j in range(len(text), i, -1):
+                sub = text[i:j]
+                if sub in self.vocab:
+                    match = sub
+                    break
+            if match:
+                tokens.append(match)
+                i += len(match)
+            else:
+                tokens.append(self.unk_token)
+                i += 1
+        return tokens
