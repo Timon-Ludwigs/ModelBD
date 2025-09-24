@@ -1,0 +1,128 @@
+from tqdm import tqdm
+import re
+import json
+from collections import Counter
+
+# Define a tokenizer class for processing chemical SMILES and special instruction tokens
+class TransformerTokenizer:
+    def __init__(self):
+        # Regular expression to tokenize SMILES strings into atoms and chemical symbols
+        self.SMILES_REGEX = r"(>>|\[[^\[\]]{1,10}\]|Br|Cl|Si|Se|Na|Ca|Li|Mg|Zn|Cu|Fe|Mn|Hg|Ag|Au|[B-IK-Zb-ik-z0-9=#$%@+\->\(\)/\\\.])"
+        
+        # Compile the regular expression pattern for faster performance
+        self.smiles_pattern = re.compile(self.SMILES_REGEX)
+
+        # Define a set of reserved special tokens used for tasks and semantic markup
+        self.special_tokens = {
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "[NOAGENT]", "[EOS]"
+        }
+
+        # Initialize empty vocab and lookup dictionaries
+        self.vocab = {}
+        self.token_to_id = {}
+        self.id_to_token = {}
+
+    # Tokenizes a single SMILES string into its atomic or symbolic tokens
+    def tokenize_smiles(self, smiles):
+        return self.smiles_pattern.findall(smiles)
+
+    # Tokenizes an entire line of input text into special tokens and SMILES tokens
+    def tokenize(self, line):
+        tokens = []
+        # Split by whitespace
+        parts = line.strip().split()
+        for part in parts:
+            if part in self.special_tokens:
+                # Directly add special tokens
+                tokens.append(part)
+            elif part.startswith("[") and "]" in part:
+                # Handles things like [TASK] reaction_gen where part of it is special
+                bracket_end = part.find("]") + 1  # Find end of bracketend token
+                maybe_special = part[:bracket_end]  # Get the bracketend part, e.g., [TASK]
+                remaining = part[bracket_end:]      # Get the rest, e.g., reaction_gen
+
+                if maybe_special in self.special_tokens:
+                    tokens.append(maybe_special)
+                    if remaining:
+                        # Add the remaining part if it's also special or tokenize it if not
+                        if remaining in self.special_tokens:
+                            tokens.append(remaining)
+                        else:
+                            tokens.extend(self.tokenize_smiles(remaining))
+                else:
+                    tokens.extend(self.tokenize_smiles(part))
+            else:
+                # Tokenize non-special strings (e.g. raw SMILES)
+                tokens.extend(self.tokenize_smiles(part))
+        return tokens
+
+    # Build vocabulary from a list of input lines (typically a corpus)
+    def build_vocab(self, corpus_lines, min_freq=1):
+        counter = Counter()
+        for line in corpus_lines:
+            tokens = self.tokenize(line)    # Tokenize the line
+            counter.update(tokens)      # Count token frequency
+
+        # Keep only tokens with frequency above min_freq, sort alphabetically
+        sorted_tokens = sorted([tok for tok, freq in counter.items() if freq >= min_freq])
+
+        # Compose the final vocabulary, starting with PAD and UNK, followed by special tokens and frequent tokens
+        vocab = ["[PAD]", "[UNK]"] + list(self.special_tokens - {"[PAD]", "[UNK]"}) + sorted_tokens
+        
+        # Create token-to-id and id-to-token mappings
+        self.vocab = vocab
+        # Builds a dictionary that maps each token in the vocabulary to a unique integer ID
+        self.token_to_id = {tok: i for i, tok in enumerate(vocab)}
+        # Builds the reverse mapping: from ID to token
+        self.id_to_token = {i: tok for tok, i in self.token_to_id.items()}
+    
+    # Converts a string into a list of token IDs
+    def encode(self, text):
+        tokens = self.tokenize(text)  # Tokenize the input text
+        # Map tokens to IDs, use UNK if not found
+        return [self.token_to_id.get(tok, self.token_to_id["[UNK]"]) for tok in tokens]
+
+    # Converts a list of token IDs back into a space-separated string of tokens
+    def decode(self, token_ids):
+        tokens = [self.id_to_token.get(i, "[UNK]") for i in token_ids]  # Map IDs back to tokens
+        return " ".join(tokens)  # Join them into a readable string
+
+    # Save the tokenizer vocabulary to a file as JSON
+    def save_vocab(self, path):
+        with open(path, "w") as f:
+            json.dump(self.token_to_id, f)
+
+    # Load the vocabulary from a file and rebuild the lookup tables
+    def load_vocab(self, path):
+        with open(path, "r") as f:
+            self.token_to_id = json.load(f)
+        self.id_to_token = {i: tok for tok, i in self.token_to_id.items()}
+        self.vocab = list(self.token_to_id.keys())
+
+
+# Instantiate the tokenizer
+tokenizer = TransformerTokenizer()
+
+# Path to a preprocessed corpus of clean SMILES + task lines
+clean_corpus = "/home/gpwuq/ipms-foundation_model/data/interim/clean_corpus4.txt"
+
+# Read all lines from the corpus into memory
+with open(clean_corpus) as f:
+    lines = f.readlines()
+
+# Build the vocabulary from the corpus, keeping all tokens with frequency >= 1
+tokenizer.build_vocab(lines, min_freq=1)
+
+""" # Encode a line
+line = "[TASK] reaction_gen [RXN] CCO>CCN"
+ids = tokenizer.encode(line)
+print(ids)
+
+# Decode it back
+print(tokenizer.decode(ids))
+
+# Another test
+print(tokenizer.tokenize("[TASK] reaction_gen [RXN] C[N+](C)(C)C.Cl")) """
+
+# Save
+tokenizer.save_vocab("/home/gpwuq/ipms-foundation_model/data/interim/clean_vocab_only_reaction_smiles.json")
